@@ -156,6 +156,117 @@ fn print_saliency(embedder: &witchcraft::Embedder, text: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mobileclip2")]
+fn print_embedding(embedding: &candle_core::Tensor) -> Result<()> {
+    let values = embedding
+        .squeeze(0)?
+        .squeeze(0)?
+        .to_device(&candle_core::Device::Cpu)?
+        .to_vec1::<f32>()?;
+    println!(
+        "[{}]",
+        values
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    Ok(())
+}
+
+#[cfg(feature = "mobileclip2")]
+fn cosine_similarity(lhs: &candle_core::Tensor, rhs: &candle_core::Tensor) -> Result<f32> {
+    Ok((lhs * rhs)?.sum_all()?.to_scalar::<f32>()?)
+}
+
+#[cfg(feature = "mobileclip2")]
+fn bench_count(value: Option<&str>, env_name: &str, default: usize) -> Result<usize> {
+    value
+        .map(str::to_owned)
+        .or_else(|| env::var(env_name).ok())
+        .map_or(Ok(default), |value| {
+            value
+                .parse::<usize>()
+                .map_err(|e| anyhow::anyhow!("invalid {env_name} value {value:?}: {e}"))
+        })
+}
+
+#[cfg(feature = "mobileclip2")]
+fn benchmark_image_embeddings(
+    embedder: &witchcraft::Embedder,
+    path: &std::path::Path,
+    args: &[String],
+) -> Result<()> {
+    let profile = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "profile" | "--profile"));
+    let counts = args
+        .iter()
+        .filter(|arg| !matches!(arg.as_str(), "profile" | "--profile"))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(counts.len() <= 2, "benchimage expects [iters] [warmup] [profile]");
+    let iters = bench_count(counts.first().copied(), "WARP_BENCH_ITERS", 25)?;
+    let warmup = bench_count(counts.get(1).copied(), "WARP_BENCH_WARMUP", 5)?;
+    anyhow::ensure!(iters > 0, "image benchmark iterations must be greater than zero");
+
+    let image = witchcraft::mobileclip2::load_image(path, embedder.image_size())?
+        .to_device(embedder.device())?
+        .unsqueeze(0)?;
+    let run = || -> Result<candle_core::Tensor> {
+        let embedding = embedder.embed_image_tensor(&image)?;
+        let checksum = embedding
+            .sum_all()?
+            .to_device(&candle_core::Device::Cpu)?
+            .to_scalar::<f32>()?;
+        std::hint::black_box(checksum);
+        Ok(embedding)
+    };
+    for _ in 0..warmup {
+        run()?;
+    }
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let started = std::time::Instant::now();
+        run()?;
+        times.push(started.elapsed());
+    }
+    times.sort_unstable();
+    let mean = times.iter().map(std::time::Duration::as_secs_f64).sum::<f64>() / iters as f64;
+    let p95 = ((iters * 95 + 99) / 100).saturating_sub(1).min(iters - 1);
+    println!("image: {}", path.display());
+    println!("device: {:?}", embedder.device().location());
+    println!("image_size: {}x{}", embedder.image_size(), embedder.image_size());
+    println!("iters: {iters} warmup: {warmup}");
+    println!(
+        "model_only: median={:.2} ms mean={:.2} ms p95={:.2} ms throughput={:.2} images/s",
+        times[iters / 2].as_secs_f64() * 1000.0,
+        mean * 1000.0,
+        times[p95].as_secs_f64() * 1000.0,
+        1.0 / mean
+    );
+
+    if profile {
+        let (embedding, profile) = embedder.embed_image_tensor_profiled(&image)?;
+        embedding
+            .sum_all()?
+            .to_device(&candle_core::Device::Cpu)?
+            .to_scalar::<f32>()?;
+        println!("profile_total_ms: {:.2}", profile.total().as_secs_f64() * 1000.0);
+        let mut records = profile.records().iter().collect::<Vec<_>>();
+        records.sort_unstable_by(|a, b| b.elapsed.cmp(&a.elapsed));
+        for record in records.into_iter().take(30) {
+            println!(
+                "  {:>8.2} ms {:<56} {:?}",
+                record.elapsed.as_secs_f64() * 1000.0,
+                record.label,
+                record.shape
+            );
+        }
+    }
+    Ok(())
+}
+
 fn split_doc(body: String) -> Vec<String> {
     let max_characters = 300;
     let splitter = TextSplitter::new(max_characters);
@@ -410,6 +521,43 @@ fn main() -> Result<()> {
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
         let text = args[2..].join(" ");
         print_saliency(&embedder, &text)?;
+    } else if args.len() == 3 && &args[1] == "image" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let device = witchcraft::make_device();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            print_embedding(&embedder.embed_image_path(&args[2])?)?;
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image embeddings require building with --features mobileclip2");
+    } else if args.len() >= 3 && &args[1] == "benchimage" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let device = witchcraft::make_device();
+            let started = std::time::Instant::now();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            println!("model_load_ms: {:.2}", started.elapsed().as_secs_f64() * 1000.0);
+            benchmark_image_embeddings(
+                &embedder,
+                std::path::Path::new(&args[2]),
+                &args[3..],
+            )?;
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image benchmarks require building with --features mobileclip2");
+    } else if args.len() >= 4 && &args[1] == "scoreimage" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let device = witchcraft::make_device();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            let image = embedder.embed_image_path(&args[2])?.squeeze(0)?.squeeze(0)?;
+            for text in &args[3..] {
+                let text_embedding = embedder.embed_text_pooled(text)?.squeeze(0)?.squeeze(0)?;
+                println!("`{text}': score={}", cosine_similarity(&image, &text_embedding)?);
+            }
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image/text scoring requires building with --features mobileclip2");
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
         let embedder = if args[1] != "fulltext" {
             let device = witchcraft::make_device();
@@ -470,7 +618,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

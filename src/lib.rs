@@ -45,18 +45,29 @@ pub mod quantized_modernbert;
 #[cfg(feature = "modernbert-quantized")]
 use quantized_modernbert as t5_encoder;
 
+#[cfg(feature = "mobileclip2")]
+pub mod mobileclip2;
+#[cfg(feature = "mobileclip2")]
+mod profiled_fastvit;
+#[cfg(feature = "mobileclip2")]
+use mobileclip2 as t5_encoder;
+
 // Compile-time checks: exactly one encoder backend required.
 #[cfg(not(any(
     feature = "t5-quantized",
     feature = "modernbert",
     feature = "modernbert-quantized",
+    feature = "mobileclip2",
 )))]
-compile_error!("Must enable exactly one encoder backend: t5-quantized, modernbert, or modernbert-quantized");
+compile_error!("Must enable exactly one encoder backend: t5-quantized, modernbert, modernbert-quantized, or mobileclip2");
 
 #[cfg(any(
     all(feature = "t5-quantized", feature = "modernbert"),
     all(feature = "t5-quantized", feature = "modernbert-quantized"),
+    all(feature = "t5-quantized", feature = "mobileclip2"),
     all(feature = "modernbert", feature = "modernbert-quantized"),
+    all(feature = "modernbert", feature = "mobileclip2"),
+    all(feature = "modernbert-quantized", feature = "mobileclip2"),
 ))]
 compile_error!("Cannot enable multiple encoder backends simultaneously");
 
@@ -269,6 +280,10 @@ fn model_id_prefix() -> &'static str {
     {
         "modernbert"
     }
+    #[cfg(feature = "mobileclip2")]
+    {
+        "mobileclip2-s0"
+    }
 }
 
 fn model_id_for_dim(dim: usize) -> String {
@@ -293,10 +308,17 @@ fn document_token_keep_fraction() -> f64 {
 }
 
 pub fn query_token_salience_enabled() -> bool {
-    !matches!(
-        std::env::var("WARP_QUERY_TOKEN_SALIENCE").as_deref(),
-        Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
-    )
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    {
+        !matches!(
+            std::env::var("WARP_QUERY_TOKEN_SALIENCE").as_deref(),
+            Ok("0") | Ok("false") | Ok("False") | Ok("FALSE") | Ok("off") | Ok("OFF")
+        )
+    }
+    #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
+    {
+        false
+    }
 }
 
 fn sigmoid(value: f32) -> f32 {

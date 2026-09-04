@@ -5,6 +5,7 @@ use log::debug;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::Tokenizer;
 
+#[cfg(not(feature = "mobileclip2"))]
 const MAX_LEN: usize = 2048;
 const STRIDE: usize = 256;
 const MIN_NORM: f32 = 1.0;
@@ -48,6 +49,16 @@ fn model_forward_with_gate_for_lengths(
         let _ = lengths;
         model_forward_with_gate(model, input)
     }
+}
+
+#[cfg(feature = "mobileclip2")]
+fn model_max_len(model: &t5_encoder::T5EncoderModel) -> usize {
+    model.max_seq_len()
+}
+
+#[cfg(not(feature = "mobileclip2"))]
+fn model_max_len(_model: &t5_encoder::T5EncoderModel) -> usize {
+    MAX_LEN
 }
 
 pub struct Embedder {
@@ -94,6 +105,62 @@ impl Embedder {
         self.embed_inner_with_tokenizer(text, true, &self.query_tokenizer)
     }
 
+    #[cfg(feature = "mobileclip2")]
+    pub fn embed_text_pooled(&self, text: &str) -> Result<Tensor> {
+        let encoding = self.tokenizer.encode(text, true).map_err(|err| anyhow!("tokenize text: {err}"))?;
+        let ids = encoding.get_ids();
+        let input = Tensor::new(ids, self.model.device())?.unsqueeze(0)?;
+        let embeddings = self.model.forward_text_pooled(&input)?.unsqueeze(1)?;
+        normalize_l2(&embeddings)
+    }
+
+    #[cfg(feature = "mobileclip2")]
+    pub fn embed_image_path<P: AsRef<std::path::Path>>(&self, path: P) -> Result<Tensor> {
+        let image = t5_encoder::load_image(path, self.model.image_size())?;
+        self.embed_image_tensor(&image)
+    }
+
+    #[cfg(feature = "mobileclip2")]
+    pub fn embed_image_tensor(&self, image: &Tensor) -> Result<Tensor> {
+        let image = match image.dims().len() {
+            3 => image.to_device(self.model.device())?.unsqueeze(0)?,
+            4 => image.to_device(self.model.device())?,
+            rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
+        };
+        let embeddings = self.model.forward_image(&image)?.unsqueeze(1)?;
+        normalize_l2(&embeddings)
+    }
+
+    #[cfg(feature = "mobileclip2")]
+    pub fn embed_image_tensor_profiled(
+        &self,
+        image: &Tensor,
+    ) -> Result<(Tensor, t5_encoder::ImageProfile)> {
+        let image = match image.dims().len() {
+            3 => image.to_device(self.model.device())?.unsqueeze(0)?,
+            4 => image.to_device(self.model.device())?,
+            rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
+        };
+        let (embeddings, mut profile) = self.model.forward_image_profiled(&image)?;
+        let embeddings = embeddings.unsqueeze(1)?;
+        self.model.device().synchronize()?;
+        let started = std::time::Instant::now();
+        let normalized = normalize_l2(&embeddings)?;
+        self.model.device().synchronize()?;
+        profile.record("normalize_l2", started.elapsed(), normalized.dims().to_vec());
+        Ok((normalized, profile))
+    }
+
+    #[cfg(feature = "mobileclip2")]
+    pub fn image_size(&self) -> usize {
+        self.model.image_size()
+    }
+
+    #[cfg(feature = "mobileclip2")]
+    pub fn device(&self) -> &Device {
+        self.model.device()
+    }
+
     pub fn embed_batch_with_gate_scores_and_tokens(&self, texts: &[String]) -> Result<Vec<EmbeddingOutput>> {
         let now = std::time::Instant::now();
         let batch_size = embedding_batch_size();
@@ -112,7 +179,7 @@ impl Embedder {
             .enumerate()
             .filter_map(|(idx, encoding)| {
                 let len = encoding.get_ids().len();
-                (len <= MAX_LEN).then_some((idx, len))
+                (len <= model_max_len(&self.model)).then_some((idx, len))
             })
             .collect::<Vec<_>>();
         batched_indices.sort_by_key(|&(_, len)| len);
@@ -216,6 +283,8 @@ impl Embedder {
         let now = std::time::Instant::now();
         let model = &self.model;
         let device = model.device();
+        let max_len = model_max_len(model);
+        let stride = if max_len > STRIDE { STRIDE } else { 0 };
 
         let encoding = tokenizer
             .encode(text, true)
@@ -231,7 +300,7 @@ impl Embedder {
 
         let mut start = 0;
         loop {
-            let end = (start + MAX_LEN).min(n_tokens);
+            let end = (start + max_len).min(n_tokens);
             let input = Tensor::new(&ids[start..end], device)?.unsqueeze(0)?;
             let (chunk, gates) = if collect_gate_scores {
                 model_forward_with_gate(model, &input)?
@@ -277,7 +346,11 @@ impl Embedder {
             if end == n_tokens {
                 break;
             }
-            start = end.saturating_sub(STRIDE); // overlap window
+            start = if stride == 0 {
+                end
+            } else {
+                end.saturating_sub(stride)
+            };
         }
 
         let token_embs: Vec<Tensor> = accum

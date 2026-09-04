@@ -21,6 +21,7 @@ ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
     # Apple Silicon: Metal GPU + Accelerate BLAS
     CLI_FEATURES := $(ENCODER),neso-metal,progress,sqlite
+    MOBILECLIP2_CLI_FEATURES := mobileclip2,neso-metal,progress,sqlite
     CAPI_FEATURES := $(ENCODER),neso-metal,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),neso-metal,napi
     PYTHON_FEATURES := $(ENCODER),neso-metal,python
@@ -29,6 +30,7 @@ ifeq ($(UNAME_S),Darwin)
   else
     # Intel Mac: Neso-generated Metal kernels (scalar Metal 2.4 fallback)
     CLI_FEATURES := $(ENCODER),neso-metal,progress,sqlite
+    MOBILECLIP2_CLI_FEATURES := mobileclip2,neso-metal,progress,sqlite
     CAPI_FEATURES := $(ENCODER),neso-metal,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),neso-metal,napi
     PYTHON_FEATURES := $(ENCODER),neso-metal,python
@@ -39,18 +41,21 @@ ifeq ($(UNAME_S),Darwin)
 else ifeq ($(UNAME_S),Linux)
   ifneq ($(NVCC),)
     CLI_FEATURES := $(ENCODER),cuda,hybrid-dequant,progress,sqlite
+    MOBILECLIP2_CLI_FEATURES := mobileclip2,cuda,progress,sqlite
     CAPI_FEATURES := $(ENCODER),cuda,hybrid-dequant,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),cuda,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),cuda,hybrid-dequant,python
   else ifeq ($(UNAME_M),aarch64)
     # Linux ARM (Graviton, Pi, Ampere): fbgemm/hybrid-dequant are x86-only
     CLI_FEATURES := $(ENCODER),progress
+    MOBILECLIP2_CLI_FEATURES := mobileclip2,progress
     CAPI_FEATURES := $(ENCODER),capi-embed-cache
     NAPI_FEATURES := $(ENCODER),napi
     PYTHON_FEATURES := $(ENCODER),python
   else
     # Linux x86_64 CPU-only
     CLI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,progress
+    MOBILECLIP2_CLI_FEATURES := mobileclip2,progress
     CAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,napi
     PYTHON_FEATURES := $(ENCODER),fbgemm,hybrid-dequant,python
@@ -152,10 +157,17 @@ modernbert-assets: assets/modernbert-config.json assets/modernbert-tokenizer.jso
 
 modernbert-quantized-assets: assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.gguf assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS
 
+mobileclip2-assets: env/bin/transformers | assets
+	@if [ ! -f assets/mobileclip2-config.json ] || [ ! -f assets/mobileclip2-tokenizer.json ] || [ ! -f assets/mobileclip2.safetensors ]; then \
+		$(PYTHON_BIN) scripts/download_mobileclip2.py; \
+	fi
+
 ifeq ($(ENCODER),modernbert)
 DOWNLOAD_TARGETS := modernbert-assets
 else ifeq ($(ENCODER),modernbert-quantized)
 DOWNLOAD_TARGETS := modernbert-quantized-assets
+else ifeq ($(ENCODER),mobileclip2)
+DOWNLOAD_TARGETS := mobileclip2-assets
 else
 DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr.gguf
 endif
@@ -238,6 +250,14 @@ test: prereqs download
 
 bench: prereqs
 	cargo run -p modernbert-bench --release --features hybrid-dequant,cuda
+
+mobileclip2-bench: prereqs mobileclip2-assets
+	@test -n "$(IMAGE)" || (echo "usage: make mobileclip2-bench IMAGE=path/to/image [ITERS=25] [WARMUP=5] [PROFILE=1]" >&2; exit 1)
+	@if [ -n "$(ITERS)" ]; then export WARP_BENCH_ITERS="$(ITERS)"; fi; \
+	if [ -n "$(WARMUP)" ]; then export WARP_BENCH_WARMUP="$(WARMUP)"; fi; \
+	profile_arg=""; \
+	if [ "$(PROFILE)" = "1" ] || [ "$(PROFILE)" = "true" ] || [ "$(PROFILE)" = "yes" ] || [ "$(PROFILE)" = "on" ]; then profile_arg="profile"; fi; \
+	cargo run --release $(BUILD_TARGET) --no-default-features --features $(MOBILECLIP2_CLI_FEATURES) --bin warp-cli -- benchimage "$(IMAGE)" $$profile_arg
 
 %: %.zst
 	zstd -dk $<
@@ -346,6 +366,8 @@ distclean:
 	download \
 	dylib \
 	macintel \
+	mobileclip2-assets \
+	mobileclip2-bench \
 	modernbert-assets \
 	modernbert-quantized-assets \
 	module \

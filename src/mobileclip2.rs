@@ -397,15 +397,83 @@ pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Re
     let image = image::ImageReader::open(path.as_ref())
         .map_err(candle_core::Error::wrap)?
         .decode()
-        .map_err(candle_core::Error::wrap)?
-        .resize_to_fill(
-            image_size as u32,
-            image_size as u32,
-            image::imageops::FilterType::Triangle,
-        )
-        .to_rgb8();
+        .map_err(candle_core::Error::wrap)?;
+    let image = preprocess_image(image, image_size)?;
     let data = image.into_raw();
     let tensor =
         Tensor::from_vec(data, (image_size, image_size, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     tensor.to_dtype(DType::F32)? / 255.0
+}
+
+fn preprocess_image(
+    image: image::DynamicImage,
+    image_size: usize,
+) -> candle_core::Result<image::RgbImage> {
+    let image_size = u32::try_from(image_size)
+        .map_err(|_| Error::other(format!("image size {image_size} does not fit in u32")))?;
+    if image_size == 0 {
+        return Err(Error::other("image size must be greater than zero").into());
+    }
+
+    let (width, height) = (image.width(), image.height());
+    if width == 0 || height == 0 {
+        return Err(Error::other("input image has zero width or height").into());
+    }
+
+    // resize_to_fill scales uniformly until the shorter source dimension fills
+    // the square. Before shrinking, remove frequencies above the destination
+    // Nyquist limit. Assuming roughly half-pixel source reconstruction blur,
+    // variances add under convolution, giving this scale-aware extra sigma.
+    let downsample = (width as f32 / image_size as f32)
+        .min(height as f32 / image_size as f32);
+    let image = if downsample > 1.0 {
+        let sigma = 0.5 * (downsample * downsample - 1.0).sqrt();
+        image.blur(sigma)
+    } else {
+        image
+    };
+
+    Ok(image
+        .resize_to_fill(
+            image_size,
+            image_size,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgb8())
+}
+
+#[cfg(test)]
+mod image_preprocessing_tests {
+    use super::*;
+
+    #[test]
+    fn downsampling_checkerboard_is_low_pass_filtered() -> candle_core::Result<()> {
+        let mut source = image::RgbImage::new(1024, 1024);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+            *pixel = image::Rgb([value, value, value]);
+        }
+
+        let resized = preprocess_image(image::DynamicImage::ImageRgb8(source), 64)?;
+        assert_eq!(resized.dimensions(), (64, 64));
+        let (min, max) = resized
+            .pixels()
+            .map(|pixel| pixel[0])
+            .fold((u8::MAX, u8::MIN), |(min, max), value| {
+                (min.min(value), max.max(value))
+            });
+        assert!(
+            max - min <= 12,
+            "checkerboard retained high frequencies: {min}..={max}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessing_preserves_cover_crop_dimensions() -> candle_core::Result<()> {
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::new(640, 320));
+        let resized = preprocess_image(source, 256)?;
+        assert_eq!(resized.dimensions(), (256, 256));
+        Ok(())
+    }
 }

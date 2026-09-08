@@ -14,6 +14,10 @@ EXPECTED = {
     "net.1.weight": (256, 512),
     "net.1.bias": (256,),
     "net.3.weight": (96, 256),
+    "token_gate_norm.weight": (512,),
+    "token_gate_norm.bias": (512,),
+    "token_gate.weight": (1, 512),
+    "token_gate.bias": (1,),
 }
 
 
@@ -29,11 +33,15 @@ def main() -> None:
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)["adapter"]
     shapes = {key: tuple(value.shape) for key, value in state.items()}
     if shapes != EXPECTED:
-        raise ValueError(f"expected v2b MLP adapter {EXPECTED}, got {shapes}")
+        raise ValueError(f"expected gated 512px MLP adapter {EXPECTED}, got {shapes}")
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    save_file({key: value.contiguous() for key, value in state.items()}, output)
+    save_file(
+        {key: value.contiguous() for key, value in state.items()},
+        output,
+        metadata={"image_size": "512", "image_tokens": "128"},
+    )
     print(f"wrote {output}")
 
 

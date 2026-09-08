@@ -35,6 +35,8 @@ const DEFAULT_EMBED_DIM: usize = 512;
 const IMAGE_DUMP_DIR_ENV: &str = "WARP_IMAGE_DUMP_DIR";
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 const XTR_IMAGE_SIZE: usize = 512;
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+const XTR_IMAGE_TOKENS: usize = 128;
 const DEFAULT_TEXT_WIDTH: usize = 512;
 const DEFAULT_TEXT_HEADS: usize = 8;
 const DEFAULT_TEXT_LAYERS: usize = 12;
@@ -195,6 +197,8 @@ struct XtrImageAdapter {
     norm: LayerNorm,
     fc1: Linear,
     fc2: Linear,
+    token_gate_norm: LayerNorm,
+    token_gate: Linear,
 }
 
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
@@ -204,12 +208,39 @@ impl XtrImageAdapter {
         let norm = layer_norm(512, 1e-5, net.pp(0))?;
         let fc1 = linear(512, 256, net.pp(1))?;
         let fc2 = linear_no_bias(256, 96, net.pp(3))?;
-        Ok(Self { norm, fc1, fc2 })
+        let token_gate_norm = layer_norm(512, 1e-5, vb.pp("token_gate_norm"))?;
+        let token_gate = linear(512, 1, vb.pp("token_gate"))?;
+        Ok(Self {
+            norm,
+            fc1,
+            fc2,
+            token_gate_norm,
+            token_gate,
+        })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.select_tokens(xs, XTR_IMAGE_TOKENS)?;
         self.fc2
-            .forward(&self.fc1.forward(&self.norm.forward(xs)?)?.gelu_erf()?)
+            .forward(&self.fc1.forward(&self.norm.forward(&xs)?)?.gelu_erf()?)
+    }
+
+    fn select_tokens(&self, xs: &Tensor, keep_tokens: usize) -> Result<Tensor> {
+        let xs = xs.contiguous()?;
+        let (batch, tokens, width) = xs.dims3()?;
+        let keep = keep_tokens.min(tokens);
+        let gate_logits = self
+            .token_gate
+            .forward(&self.token_gate_norm.forward(&xs)?)?
+            .squeeze(2)?;
+        let indices = gate_logits
+            .contiguous()?
+            .arg_sort_last_dim(false)?
+            .narrow(1, 0, keep)?
+            .unsqueeze(2)?
+            .broadcast_as((batch, keep, width))?
+            .contiguous()?;
+        xs.gather(&indices, 1)
     }
 }
 
@@ -251,7 +282,8 @@ impl XtrImageEncoder {
         })
     }
 
-    /// Return 256 normalized-ready 96d patch vectors for a 512x512 image.
+    /// Return the 128 most salient normalized-ready 96d patch vectors for a
+    /// 512x512 image.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
         self.adapter
             .forward(&self.vision_model.forward_patches(pixel_values)?)

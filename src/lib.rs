@@ -3203,7 +3203,7 @@ pub fn compute_cached_embeddings(
 
 /// Encode an image into the same packed cache format used by text documents.
 ///
-/// Combined MobileCLIP2/ModernBERT builds produce 256 normalized 96d patch
+/// Combined MobileCLIP2/ModernBERT builds produce 128 gated, normalized 96d patch
 /// vectors, ready for the regular XTR indexing pipeline.
 #[cfg(feature = "mobileclip2")]
 pub fn compute_cached_image_embeddings<P: AsRef<Path>>(
@@ -4273,11 +4273,11 @@ fn token_counts_use_utf8_byte_offsets() {
 ))]
 #[test]
 fn image_embeddings_use_one_xtr_document() {
-    let output = Tensor::zeros((1, 256, 96), DType::F32, &Device::Cpu).unwrap();
+    let output = Tensor::zeros((1, 128, 96), DType::F32, &Device::Cpu).unwrap();
     let cached = cached_image_embeddings_from_output(output).unwrap();
     assert_eq!(dim_from_model_id(&cached.model), 96);
-    assert_eq!(cached.counts, "256");
-    assert_eq!(cached.embedding_count, 256);
+    assert_eq!(cached.counts, "128");
+    assert_eq!(cached.embedding_count, 128);
 }
 
 #[test]

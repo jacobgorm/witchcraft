@@ -6,10 +6,9 @@ use candle_nn::{Linear, VarBuilder};
 use candle_nn::{layer_norm, linear, linear_no_bias, LayerNorm};
 use candle_transformers::models::{fastvit, openclip::text_model};
 use serde::Deserialize;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Error;
-use std::path::Path;
-#[cfg(not(feature = "embed-assets"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 use crate::profiled_fastvit::ProfiledFastVit;
@@ -33,6 +32,7 @@ embed_asset!(pub XTR_ADAPTER, "mobileclip2-xtr.safetensors");
 
 const DEFAULT_CONTEXT_LENGTH: usize = 77;
 const DEFAULT_EMBED_DIM: usize = 512;
+const IMAGE_DUMP_DIR_ENV: &str = "WARP_IMAGE_DUMP_DIR";
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 const XTR_IMAGE_SIZE: usize = 512;
 const DEFAULT_TEXT_WIDTH: usize = 512;
@@ -491,15 +491,65 @@ fn load_pth_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBuild
 }
 
 pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Result<Tensor> {
-    let image = image::ImageReader::open(path.as_ref())
+    let path = path.as_ref();
+    let image = image::ImageReader::open(path)
         .map_err(candle_core::Error::wrap)?
         .decode()
         .map_err(candle_core::Error::wrap)?;
     let image = preprocess_image(image, image_size)?;
+    dump_preprocessed_image(path, &image, image_size)?;
     let data = image.into_raw();
     let tensor =
         Tensor::from_vec(data, (image_size, image_size, 3), &Device::Cpu)?.permute((2, 0, 1))?;
     tensor.to_dtype(DType::F32)? / 255.0
+}
+
+fn dump_preprocessed_image(
+    source: &Path,
+    image: &image::RgbImage,
+    image_size: usize,
+) -> candle_core::Result<()> {
+    let Some(directory) = std::env::var_os(IMAGE_DUMP_DIR_ENV) else {
+        return Ok(());
+    };
+    let destination = write_preprocessed_image(Path::new(&directory), source, image, image_size)?;
+    log::info!("wrote preprocessed image to {}", destination.display());
+    Ok(())
+}
+
+fn write_preprocessed_image(
+    directory: &Path,
+    source: &Path,
+    image: &image::RgbImage,
+    image_size: usize,
+) -> candle_core::Result<PathBuf> {
+    let destination = preprocessed_image_dump_path(directory, source, image_size);
+    std::fs::create_dir_all(directory).map_err(candle_core::Error::wrap)?;
+    image.save(&destination).map_err(candle_core::Error::wrap)?;
+    Ok(destination)
+}
+
+fn preprocessed_image_dump_path(directory: &Path, source: &Path, image_size: usize) -> PathBuf {
+    let source = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    image_size.hash(&mut hasher);
+    let digest = hasher.finish();
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    directory.join(format!("{stem}-{digest:016x}-{image_size}x{image_size}.png"))
 }
 
 fn preprocess_image(
@@ -571,6 +621,23 @@ mod image_preprocessing_tests {
         let source = image::DynamicImage::ImageRgb8(image::RgbImage::new(640, 320));
         let resized = preprocess_image(source, 256)?;
         assert_eq!(resized.dimensions(), (256, 256));
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessed_debug_dump_is_a_decodable_png() -> candle_core::Result<()> {
+        let directory = tempfile::tempdir().map_err(candle_core::Error::wrap)?;
+        let source = Path::new("photos/a difficult name.jpg");
+        let image = image::RgbImage::new(512, 512);
+        let destination = write_preprocessed_image(directory.path(), source, &image, 512)?;
+
+        assert!(destination
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("a_difficult_name-"));
+        let decoded = image::open(destination).map_err(candle_core::Error::wrap)?;
+        assert_eq!((decoded.width(), decoded.height()), (512, 512));
         Ok(())
     }
 }

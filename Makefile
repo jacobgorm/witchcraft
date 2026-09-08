@@ -10,7 +10,7 @@ ifeq ($(UNAME_S),Linux)
   NVCC := $(or $(shell which nvcc 2>/dev/null),$(wildcard /usr/local/cuda/bin/nvcc),$(wildcard /opt/cuda/bin/nvcc))
 endif
 
-ENCODER ?= modernbert-quantized
+ENCODER ?= mobileclip2-modernbert-quantized
 NESO_DIR ?= ../neso
 NESO_PYTHON ?= $(NESO_DIR)/env/bin/python
 #ENCODER ?= modernbert
@@ -162,6 +162,9 @@ mobileclip2-assets: env/bin/transformers | assets
 		$(PYTHON_BIN) scripts/download_mobileclip2.py; \
 	fi
 
+mobileclip2-xtr-assets: modernbert-assets mobileclip2-assets
+	@test -f assets/mobileclip2-xtr.safetensors || (echo "missing assets/mobileclip2-xtr.safetensors; run scripts/export_mobileclip2_xtr.py <checkpoint> assets/mobileclip2-xtr.safetensors" >&2; exit 1)
+
 ifeq ($(ENCODER),modernbert)
 DOWNLOAD_TARGETS := modernbert-assets
 else ifeq ($(ENCODER),modernbert-quantized)
@@ -258,6 +261,10 @@ mobileclip2-bench: prereqs mobileclip2-assets
 	profile_arg=""; \
 	if [ "$(PROFILE)" = "1" ] || [ "$(PROFILE)" = "true" ] || [ "$(PROFILE)" = "yes" ] || [ "$(PROFILE)" = "on" ]; then profile_arg="profile"; fi; \
 	cargo run --release $(BUILD_TARGET) --no-default-features --features $(MOBILECLIP2_CLI_FEATURES) --bin warp-cli -- benchimage "$(IMAGE)" $$profile_arg
+
+mobileclip2-xtr: prereqs mobileclip2-xtr-assets
+	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES),mobileclip2 --bin warp-cli
+	ln -sf $(CLI_BIN) ./warp-cli
 
 %: %.zst
 	zstd -dk $<

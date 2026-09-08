@@ -1257,6 +1257,109 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     embed_chunks_with_cache(db, embedder, &cache, limit)
 }
 
+/// Cache a document's image vectors under its existing content hash so the
+/// regular indexing and search pipelines treat them like text token vectors.
+#[cfg(feature = "mobileclip2")]
+pub fn cache_image_embeddings(
+    db: &DB,
+    embedder: &Embedder,
+    rowid: u64,
+    path: &std::path::Path,
+) -> Result<usize> {
+    let embeddings = crate::compute_cached_image_embeddings(embedder, path)?;
+    ensure_image_document(db, rowid, path)?;
+    let hash = document_hash_for_rowid(db, rowid)?
+        .ok_or_else(|| anyhow::anyhow!("failed to register image document rowid {rowid}"))?;
+    let count = embeddings.embedding_count;
+    SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
+    Ok(count)
+}
+
+/// Register an image as a document using the database's normal rowid allocator,
+/// then cache its vectors. Re-indexing the same canonical path reuses its rowid.
+#[cfg(feature = "mobileclip2")]
+pub fn cache_image_embeddings_auto(
+    db: &mut DB,
+    embedder: &Embedder,
+    path: &std::path::Path,
+) -> Result<(u64, usize)> {
+    let embeddings = crate::compute_cached_image_embeddings(embedder, path)?;
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let body = canonical_path.to_string_lossy();
+    let existing_rowid = db
+        .query("SELECT rowid FROM document WHERE body = ?1 LIMIT 1")?
+        .query_row((body.as_ref(),), |row| row.get::<_, i64>(0))
+        .optional()?;
+    if let Some(rowid) = existing_rowid {
+        let rowid: u64 = rowid.try_into()?;
+        let hash = document_hash_for_rowid(db, rowid)?
+            .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cache hash"))?;
+        let count = embeddings.embedding_count;
+        SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
+        return Ok((rowid, count));
+    }
+
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("image:{}", canonical_path.display()).as_bytes(),
+    );
+    let metadata = serde_json::json!({ "key": body.as_ref() }).to_string();
+    db.add_doc(None, &uuid, None, &metadata, &body, None)?;
+
+    let rowid: u64 = db
+        .query("SELECT rowid FROM document WHERE uuid = ?1")?
+        .query_row((uuid.to_string(),), |row| row.get::<_, i64>(0))?
+        .try_into()?;
+    let hash = document_hash_for_rowid(db, rowid)?
+        .ok_or_else(|| anyhow::anyhow!("failed to register image document rowid {rowid}"))?;
+    let count = embeddings.embedding_count;
+    SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
+    Ok((rowid, count))
+}
+
+#[cfg(feature = "mobileclip2")]
+fn ensure_image_document(db: &DB, rowid: u64, path: &std::path::Path) -> Result<()> {
+    let rowid = i64::try_from(rowid)?;
+    let mut query = db.query("SELECT length(body) FROM document WHERE rowid = ?1")?;
+    let body_len = query
+        .query_row((rowid,), |row| row.get::<_, Option<i64>>(0))
+        .optional()?;
+    if body_len.flatten().unwrap_or(0) > 0 {
+        return Ok(());
+    }
+    drop(query);
+
+    let body = path.to_string_lossy();
+    let lens = body.chars().count().to_string();
+    let hash = document_cache_hash(&body, &lens);
+    if body_len.is_some() {
+        db.query("UPDATE document SET hash = ?1, body = ?2, lens = ?3 WHERE rowid = ?4")?
+            .execute((&hash, body.as_ref(), &lens, rowid))?;
+        return Ok(());
+    }
+
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("image:{rowid}:{}", path.display()).as_bytes(),
+    );
+    let metadata = serde_json::json!({ "key": body.as_ref() }).to_string();
+    let date = iso8601_timestamp::Timestamp::now_utc().to_string();
+    db.query(
+        "INSERT INTO document(rowid, uuid, date, metadata, hash, body, lens)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?
+    .execute((
+        rowid,
+        uuid.to_string(),
+        date,
+        metadata,
+        hash,
+        body.as_ref(),
+        lens,
+    ))?;
+    Ok(())
+}
+
 pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
     let index = index_for_db(db);
     current_sqlite_cached_unmaterialized_embedding_count(&index, db)

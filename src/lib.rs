@@ -49,7 +49,10 @@ use quantized_modernbert as t5_encoder;
 pub mod mobileclip2;
 #[cfg(feature = "mobileclip2")]
 mod profiled_fastvit;
-#[cfg(feature = "mobileclip2")]
+#[cfg(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 use mobileclip2 as t5_encoder;
 
 // Compile-time checks: exactly one encoder backend required.
@@ -66,8 +69,6 @@ compile_error!("Must enable exactly one encoder backend: t5-quantized, modernber
     all(feature = "t5-quantized", feature = "modernbert-quantized"),
     all(feature = "t5-quantized", feature = "mobileclip2"),
     all(feature = "modernbert", feature = "modernbert-quantized"),
-    all(feature = "modernbert", feature = "mobileclip2"),
-    all(feature = "modernbert-quantized", feature = "mobileclip2"),
 ))]
 compile_error!("Cannot enable multiple encoder backends simultaneously");
 
@@ -131,6 +132,8 @@ pub use sqlite_index::{
     match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
     search_with_fulltext_prefix_wildcard, semantic_index_unavailable_reason,
 };
+#[cfg(all(feature = "sqlite", feature = "mobileclip2"))]
+pub use sqlite_index::{cache_image_embeddings, cache_image_embeddings_auto};
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
 
@@ -280,7 +283,10 @@ fn model_id_prefix() -> &'static str {
     {
         "modernbert"
     }
-    #[cfg(feature = "mobileclip2")]
+    #[cfg(all(
+        feature = "mobileclip2",
+        not(any(feature = "modernbert", feature = "modernbert-quantized"))
+    ))]
     {
         "mobileclip2-s0"
     }
@@ -3195,6 +3201,33 @@ pub fn compute_cached_embeddings(
     cached_embeddings_from_output(body, lens, output)
 }
 
+/// Encode an image into the same packed cache format used by text documents.
+///
+/// Combined MobileCLIP2/ModernBERT builds produce 64 normalized 96d patch
+/// vectors, ready for the regular XTR indexing pipeline.
+#[cfg(feature = "mobileclip2")]
+pub fn compute_cached_image_embeddings<P: AsRef<Path>>(
+    embedder: &Embedder,
+    path: P,
+) -> Result<CachedEmbeddings> {
+    cached_image_embeddings_from_output(embedder.embed_image_path(path)?)
+}
+
+#[cfg(feature = "mobileclip2")]
+pub fn cached_image_embeddings_from_output(output: Tensor) -> Result<CachedEmbeddings> {
+    let embeddings = output
+        .squeeze(0)?
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?;
+    let (rows, cols) = embeddings.dims2()?;
+    Ok(CachedEmbeddings {
+        model: model_id_for_dim(cols),
+        counts: rows.to_string(),
+        embedding_count: rows,
+        embeddings: embeddings.embeddings_to_packed()?,
+    })
+}
+
 pub fn compute_cached_embeddings_many(
     embedder: &Embedder,
     bodies: &[String],
@@ -4231,6 +4264,20 @@ fn token_counts_match_document_chunk_count() {
 fn token_counts_use_utf8_byte_offsets() {
     let counts = token_counts_for_lens("åbcde", "3,2", &[(0, 2), (2, 4), (4, 6)]).unwrap();
     assert_eq!(counts, vec![2, 1]);
+}
+
+#[cfg(all(
+    test,
+    feature = "mobileclip2",
+    any(feature = "modernbert", feature = "modernbert-quantized")
+))]
+#[test]
+fn image_embeddings_use_one_xtr_document() {
+    let output = Tensor::zeros((1, 64, 96), DType::F32, &Device::Cpu).unwrap();
+    let cached = cached_image_embeddings_from_output(output).unwrap();
+    assert_eq!(dim_from_model_id(&cached.model), 96);
+    assert_eq!(cached.counts, "64");
+    assert_eq!(cached.embedding_count, 64);
 }
 
 #[test]

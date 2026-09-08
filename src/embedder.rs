@@ -5,7 +5,10 @@ use log::debug;
 use tokenizers::pre_tokenizers::PreTokenizerWrapper;
 use tokenizers::Tokenizer;
 
-#[cfg(not(feature = "mobileclip2"))]
+#[cfg(not(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+)))]
 const MAX_LEN: usize = 2048;
 const STRIDE: usize = 256;
 const MIN_NORM: f32 = 1.0;
@@ -51,12 +54,18 @@ fn model_forward_with_gate_for_lengths(
     }
 }
 
-#[cfg(feature = "mobileclip2")]
+#[cfg(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 fn model_max_len(model: &t5_encoder::T5EncoderModel) -> usize {
     model.max_seq_len()
 }
 
-#[cfg(not(feature = "mobileclip2"))]
+#[cfg(not(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+)))]
 fn model_max_len(_model: &t5_encoder::T5EncoderModel) -> usize {
     MAX_LEN
 }
@@ -65,6 +74,11 @@ pub struct Embedder {
     tokenizer: Tokenizer,
     query_tokenizer: Tokenizer,
     model: t5_encoder::T5EncoderModel,
+    #[cfg(all(
+        feature = "mobileclip2",
+        any(feature = "modernbert", feature = "modernbert-quantized")
+    ))]
+    image_model: crate::mobileclip2::XtrImageEncoder,
 }
 
 pub struct EmbeddingOutput {
@@ -79,7 +93,21 @@ impl Embedder {
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
         let query_tokenizer = tokenizer_for_queries(&tokenizer);
         let model = builder.build_encoder(device, assets)?;
-        Ok(Self { tokenizer, query_tokenizer, model })
+        #[cfg(all(
+            feature = "mobileclip2",
+            any(feature = "modernbert", feature = "modernbert-quantized")
+        ))]
+        let image_model = crate::mobileclip2::XtrImageEncoder::load(device, assets)?;
+        Ok(Self {
+            tokenizer,
+            query_tokenizer,
+            model,
+            #[cfg(all(
+                feature = "mobileclip2",
+                any(feature = "modernbert", feature = "modernbert-quantized")
+            ))]
+            image_model,
+        })
     }
 
     pub fn embed(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {
@@ -107,16 +135,24 @@ impl Embedder {
 
     #[cfg(feature = "mobileclip2")]
     pub fn embed_text_pooled(&self, text: &str) -> Result<Tensor> {
+        #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+        {
+            let (tokens, _) = self.embed(text)?;
+            return normalize_l2(&tokens.mean(1)?.unsqueeze(1)?);
+        }
+        #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
+        {
         let encoding = self.tokenizer.encode(text, true).map_err(|err| anyhow!("tokenize text: {err}"))?;
         let ids = encoding.get_ids();
         let input = Tensor::new(ids, self.model.device())?.unsqueeze(0)?;
         let embeddings = self.model.forward_text_pooled(&input)?.unsqueeze(1)?;
         normalize_l2(&embeddings)
+        }
     }
 
     #[cfg(feature = "mobileclip2")]
     pub fn embed_image_path<P: AsRef<std::path::Path>>(&self, path: P) -> Result<Tensor> {
-        let image = t5_encoder::load_image(path, self.model.image_size())?;
+        let image = crate::mobileclip2::load_image(path, self.image_size())?;
         self.embed_image_tensor(&image)
     }
 
@@ -127,6 +163,9 @@ impl Embedder {
             4 => image.to_device(self.model.device())?,
             rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
         };
+        #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+        let embeddings = self.image_model.forward(&image)?;
+        #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
         let embeddings = self.model.forward_image(&image)?.unsqueeze(1)?;
         normalize_l2(&embeddings)
     }
@@ -135,14 +174,19 @@ impl Embedder {
     pub fn embed_image_tensor_profiled(
         &self,
         image: &Tensor,
-    ) -> Result<(Tensor, t5_encoder::ImageProfile)> {
+    ) -> Result<(Tensor, crate::mobileclip2::ImageProfile)> {
         let image = match image.dims().len() {
             3 => image.to_device(self.model.device())?.unsqueeze(0)?,
             4 => image.to_device(self.model.device())?,
             rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
         };
-        let (embeddings, mut profile) = self.model.forward_image_profiled(&image)?;
-        let embeddings = embeddings.unsqueeze(1)?;
+        #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+        let (embeddings, mut profile) = self.image_model.forward_profiled(&image)?;
+        #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
+        let (embeddings, mut profile) = {
+            let (embeddings, profile) = self.model.forward_image_profiled(&image)?;
+            (embeddings.unsqueeze(1)?, profile)
+        };
         self.model.device().synchronize()?;
         let started = std::time::Instant::now();
         let normalized = normalize_l2(&embeddings)?;
@@ -153,11 +197,17 @@ impl Embedder {
 
     #[cfg(feature = "mobileclip2")]
     pub fn image_size(&self) -> usize {
+        #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+        return self.image_model.image_size();
+        #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
         self.model.image_size()
     }
 
     #[cfg(feature = "mobileclip2")]
     pub fn device(&self) -> &Device {
+        #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+        return self.image_model.device();
+        #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
         self.model.device()
     }
 

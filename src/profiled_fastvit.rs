@@ -767,13 +767,28 @@ impl ProfiledFastVit {
         })
     }
 
-    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    fn forward_features(&self, xs: &Tensor) -> Result<Tensor> {
         let mut xs = self.stem.forward(xs)?;
         for stage in &self.stages {
             xs = stage.forward(&xs)?;
         }
-        xs = self.final_conv.forward(&xs)?;
-        xs.mean(D::Minus2)?.mean(D::Minus1)?.apply(&self.cls)
+        self.final_conv.forward(&xs)
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_features(xs)?
+            .mean(D::Minus2)?
+            .mean(D::Minus1)?
+            .apply(&self.cls)
+    }
+
+    /// Return the projected spatial grid before global average pooling.
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    pub fn forward_patches(&self, xs: &Tensor) -> Result<Tensor> {
+        self.forward_features(xs)?
+            .flatten_from(2)?
+            .transpose(D::Minus1, D::Minus2)?
+            .apply(&self.cls)
     }
 
     pub fn forward_profiled(&self, xs: &Tensor) -> Result<(Tensor, ImageProfile)> {
@@ -787,6 +802,23 @@ impl ProfiledFastVit {
             .forward_profiled(&xs, "final_conv", &mut profile, &self.device)?;
         let xs = profile.time(&self.device, "head.pool", || {
             xs.mean(D::Minus2)?.mean(D::Minus1)
+        })?;
+        let xs = profile.time(&self.device, "head.fc", || xs.apply(&self.cls))?;
+        Ok((xs, profile))
+    }
+
+    #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+    pub fn forward_patches_profiled(&self, xs: &Tensor) -> Result<(Tensor, ImageProfile)> {
+        let mut profile = ImageProfile::default();
+        let mut xs = self.stem.forward_profiled(xs, &mut profile, &self.device)?;
+        for (idx, stage) in self.stages.iter().enumerate() {
+            xs = stage.forward_profiled(&xs, idx, &mut profile, &self.device)?;
+        }
+        xs = self
+            .final_conv
+            .forward_profiled(&xs, "final_conv", &mut profile, &self.device)?;
+        let xs = profile.time(&self.device, "head.flatten", || {
+            xs.flatten_from(2)?.transpose(D::Minus1, D::Minus2)
         })?;
         let xs = profile.time(&self.device, "head.fc", || xs.apply(&self.cls))?;
         Ok((xs, profile))

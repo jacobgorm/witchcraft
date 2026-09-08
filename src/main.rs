@@ -158,25 +158,33 @@ fn print_saliency(embedder: &witchcraft::Embedder, text: &str) -> Result<()> {
 
 #[cfg(feature = "mobileclip2")]
 fn print_embedding(embedding: &candle_core::Tensor) -> Result<()> {
-    let values = embedding
+    let embedding = embedding
         .squeeze(0)?
-        .squeeze(0)?
-        .to_device(&candle_core::Device::Cpu)?
-        .to_vec1::<f32>()?;
-    println!(
-        "[{}]",
-        values
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+        .to_device(&candle_core::Device::Cpu)?;
+    let (tokens, _) = embedding.dims2()?;
+    if tokens == 1 {
+        println!("{}", serde_json::to_string(&embedding.squeeze(0)?.to_vec1::<f32>()?)?);
+    } else {
+        println!("{}", serde_json::to_string(&embedding.to_vec2::<f32>()?)?);
+    }
     Ok(())
 }
 
-#[cfg(feature = "mobileclip2")]
+#[cfg(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 fn cosine_similarity(lhs: &candle_core::Tensor, rhs: &candle_core::Tensor) -> Result<f32> {
     Ok((lhs * rhs)?.sum_all()?.to_scalar::<f32>()?)
+}
+
+#[cfg(all(
+    feature = "mobileclip2",
+    any(feature = "modernbert", feature = "modernbert-quantized")
+))]
+fn maxsim_similarity(query: &candle_core::Tensor, image: &candle_core::Tensor) -> Result<f32> {
+    let similarities = query.matmul(&image.transpose(0, 1)?)?;
+    Ok(similarities.max(1)?.mean_all()?.to_scalar::<f32>()?)
 }
 
 #[cfg(feature = "mobileclip2")]
@@ -237,6 +245,7 @@ fn benchmark_image_embeddings(
     println!("image: {}", path.display());
     println!("device: {:?}", embedder.device().location());
     println!("image_size: {}x{}", embedder.image_size(), embedder.image_size());
+    println!("embedding_shape: {:?}", run()?.dims());
     println!("iters: {iters} warmup: {warmup}");
     println!(
         "model_only: median={:.2} ms mean={:.2} ms p95={:.2} ms throughput={:.2} images/s",
@@ -516,6 +525,38 @@ fn main() -> Result<()> {
         )
         .unwrap();
         println!("reindex: done");
+    } else if (args.len() == 3 || args.len() == 4) && &args[1] == "indeximage" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let device = witchcraft::make_device();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            let mut db = DB::new_fast(db_name)?;
+            let (rowid, count) = if args.len() == 3 {
+                witchcraft::cache_image_embeddings_auto(
+                    &mut db,
+                    &embedder,
+                    std::path::Path::new(&args[2]),
+                )?
+            } else {
+                let rowid = args[2].parse::<u64>()?;
+                let count = witchcraft::cache_image_embeddings(
+                    &db,
+                    &embedder,
+                    rowid,
+                    std::path::Path::new(&args[3]),
+                )?;
+                (rowid, count)
+            };
+            witchcraft::index_chunks_with_options(
+                &db,
+                Some(&embedder),
+                false,
+                witchcraft::IndexOptions::default().force_flush(),
+            )?;
+            println!("indexed {count} image vectors for rowid {rowid}");
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image indexing requires building with --features mobileclip2");
     } else if args.len() >= 3 && &args[1] == "saliency" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
@@ -550,10 +591,21 @@ fn main() -> Result<()> {
         {
             let device = witchcraft::make_device();
             let embedder = witchcraft::Embedder::new(&device, &assets)?;
-            let image = embedder.embed_image_path(&args[2])?.squeeze(0)?.squeeze(0)?;
+            let image = embedder.embed_image_path(&args[2])?.squeeze(0)?;
             for text in &args[3..] {
-                let text_embedding = embedder.embed_text_pooled(text)?.squeeze(0)?.squeeze(0)?;
-                println!("`{text}': score={}", cosine_similarity(&image, &text_embedding)?);
+                #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+                {
+                    let query = embedder.embed(text)?.0.squeeze(0)?;
+                    println!("`{text}': score={}", maxsim_similarity(&query, &image)?);
+                }
+                #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
+                {
+                    let text_embedding = embedder.embed_text_pooled(text)?.squeeze(0)?.squeeze(0)?;
+                    println!(
+                        "`{text}': score={}",
+                        cosine_similarity(&image.squeeze(0)?, &text_embedding)?
+                    );
+                }
             }
         }
         #[cfg(not(feature = "mobileclip2"))]

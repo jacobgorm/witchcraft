@@ -2,6 +2,8 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{Linear, VarBuilder};
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+use candle_nn::{layer_norm, linear, linear_no_bias, LayerNorm};
 use candle_transformers::models::{fastvit, openclip::text_model};
 use serde::Deserialize;
 use std::io::Error;
@@ -13,7 +15,11 @@ use tokenizers::Tokenizer;
 use crate::profiled_fastvit::ProfiledFastVit;
 pub use crate::profiled_fastvit::{ImageProfile, ProfileRecord};
 
-#[cfg(feature = "embed-assets")]
+#[cfg(any(
+    feature = "embed-assets",
+    feature = "modernbert",
+    feature = "modernbert-quantized"
+))]
 use crate::embed_asset;
 
 #[cfg(feature = "embed-assets")]
@@ -22,6 +28,8 @@ embed_asset!(pub CONFIG, "mobileclip2-config.json");
 embed_asset!(pub TOKENIZER, "mobileclip2-tokenizer.json");
 #[cfg(feature = "embed-assets")]
 embed_asset!(pub MODEL, "mobileclip2.safetensors");
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+embed_asset!(pub XTR_ADAPTER, "mobileclip2-xtr.safetensors");
 
 const DEFAULT_CONTEXT_LENGTH: usize = 77;
 const DEFAULT_EMBED_DIM: usize = 512;
@@ -177,6 +185,93 @@ pub struct T5EncoderModel {
     context_length: usize,
     image_size: usize,
     device: Device,
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+#[derive(Clone, Debug)]
+struct XtrImageAdapter {
+    norm: LayerNorm,
+    fc1: Linear,
+    fc2: Linear,
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+impl XtrImageAdapter {
+    fn load(vb: VarBuilder) -> Result<Self> {
+        let net = vb.pp("net");
+        let norm = layer_norm(512, 1e-5, net.pp(0))?;
+        let fc1 = linear(512, 256, net.pp(1))?;
+        let fc2 = linear_no_bias(256, 96, net.pp(3))?;
+        Ok(Self { norm, fc1, fc2 })
+    }
+
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        self.fc2
+            .forward(&self.fc1.forward(&self.norm.forward(xs)?)?.gelu_erf()?)
+    }
+}
+
+/// MobileCLIP2 vision tower followed by the trained ModernBERT-XTR adapter.
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+#[derive(Clone, Debug)]
+pub struct XtrImageEncoder {
+    vision_model: ProfiledFastVit,
+    adapter: XtrImageAdapter,
+    image_size: usize,
+    device: Device,
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+impl XtrImageEncoder {
+    pub fn load(device: &Device, assets: &Path) -> Result<Self> {
+        let (builder, _) = T5ModelBuilder::load(assets)?;
+        let vision_config = builder.config.vision_model_config()?;
+        let mobileclip_vb = load_weights(device, assets)?;
+        let vision_model = ProfiledFastVit::new(
+            &vision_config,
+            builder.config.embed_dim,
+            mobileclip_vb.pp("visual.trunk"),
+        )?;
+        let adapter_bytes = XTR_ADAPTER
+            .bytes(assets)
+            .map_err(|_| Error::other("failed to read mobileclip2-xtr.safetensors"))?;
+        let adapter_vb = VarBuilder::from_buffered_safetensors(
+            adapter_bytes.to_vec(),
+            DType::F32,
+            device,
+        )?;
+        let adapter = XtrImageAdapter::load(adapter_vb)?;
+        Ok(Self {
+            vision_model,
+            adapter,
+            image_size: builder.config.vision_cfg.image_size,
+            device: device.clone(),
+        })
+    }
+
+    /// Return 64 normalized-ready 96d patch vectors for a 256x256 image.
+    pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
+        self.adapter
+            .forward(&self.vision_model.forward_patches(pixel_values)?)
+    }
+
+    pub fn forward_profiled(&self, pixel_values: &Tensor) -> Result<(Tensor, ImageProfile)> {
+        let (patches, mut profile) = self.vision_model.forward_patches_profiled(pixel_values)?;
+        self.device.synchronize()?;
+        let started = std::time::Instant::now();
+        let output = self.adapter.forward(&patches)?;
+        self.device.synchronize()?;
+        profile.record("xtr_adapter", started.elapsed(), output.dims().to_vec());
+        Ok((output, profile))
+    }
+
+    pub fn image_size(&self) -> usize {
+        self.image_size
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
 impl T5EncoderModel {

@@ -33,6 +33,8 @@ embed_asset!(pub XTR_ADAPTER, "mobileclip2-xtr.safetensors");
 
 const DEFAULT_CONTEXT_LENGTH: usize = 77;
 const DEFAULT_EMBED_DIM: usize = 512;
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+const XTR_IMAGE_SIZE: usize = 512;
 const DEFAULT_TEXT_WIDTH: usize = 512;
 const DEFAULT_TEXT_HEADS: usize = 8;
 const DEFAULT_TEXT_LAYERS: usize = 12;
@@ -244,12 +246,12 @@ impl XtrImageEncoder {
         Ok(Self {
             vision_model,
             adapter,
-            image_size: builder.config.vision_cfg.image_size,
+            image_size: XTR_IMAGE_SIZE,
             device: device.clone(),
         })
     }
 
-    /// Return 64 normalized-ready 96d patch vectors for a 256x256 image.
+    /// Return 256 normalized-ready 96d patch vectors for a 512x512 image.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
         self.adapter
             .forward(&self.vision_model.forward_patches(pixel_values)?)

@@ -33,6 +33,14 @@ RESIDUAL_MLP_EXPECTED = {
     "residual.3.weight": (96, 128),
 }
 
+RESIDUAL_GATED_MLP_EXPECTED = {
+    **RESIDUAL_MLP_EXPECTED,
+    "token_gate_norm.weight": (512,),
+    "token_gate_norm.bias": (512,),
+    "token_gate.weight": (1, 512),
+    "token_gate.bias": (1,),
+}
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -43,6 +51,11 @@ def main() -> None:
         type=float,
         help="Residual multiplier; defaults to the checkpoint's config.json value",
     )
+    parser.add_argument(
+        "--image-tokens",
+        type=int,
+        help="Number of gated image tokens to export; defaults to export_image_tokens",
+    )
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint)
@@ -50,19 +63,36 @@ def main() -> None:
         checkpoint = checkpoint / "mobileclip2_modernbert.pt"
     state = torch.load(checkpoint, map_location="cpu", weights_only=True)["adapter"]
     shapes = {key: tuple(value.shape) for key, value in state.items()}
+    config = {}
+    config_path = checkpoint.parent / "config.json"
+    if config_path.is_file():
+        import json
+
+        config = json.loads(config_path.read_text())
+
     if shapes == GATED_MLP_EXPECTED:
         adapter_type = "gated_mlp"
-        image_tokens = 128
+        image_tokens = args.image_tokens or int(config.get("export_image_tokens", 128))
         residual_scale = None
     elif shapes == RESIDUAL_MLP_EXPECTED:
         adapter_type = "residual_mlp"
         image_tokens = 256
         residual_scale = args.residual_scale
-        config_path = checkpoint.parent / "config.json"
-        if residual_scale is None and config_path.is_file():
-            import json
-
-            residual_scale = float(json.loads(config_path.read_text())["residual_scale"])
+        if residual_scale is None and config:
+            residual_scale = float(config["residual_scale"])
+        if residual_scale is None:
+            raise ValueError("residual adapter requires --residual-scale or config.json")
+    elif shapes == RESIDUAL_GATED_MLP_EXPECTED:
+        adapter_type = "residual_gated_mlp"
+        image_tokens = args.image_tokens or config.get("export_image_tokens")
+        if image_tokens is None:
+            raise ValueError(
+                "gated residual adapter requires --image-tokens or export_image_tokens"
+            )
+        image_tokens = int(image_tokens)
+        residual_scale = args.residual_scale
+        if residual_scale is None and config:
+            residual_scale = float(config["residual_scale"])
         if residual_scale is None:
             raise ValueError("residual adapter requires --residual-scale or config.json")
     else:

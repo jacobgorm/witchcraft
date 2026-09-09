@@ -222,11 +222,20 @@ enum XtrImageAdapter {
         mlp: MlpImageAdapter,
         token_gate_norm: LayerNorm,
         token_gate: Linear,
+        keep_tokens: usize,
     },
     Residual {
         base: MlpImageAdapter,
         residual: MlpImageAdapter,
         scale: f64,
+    },
+    ResidualGated {
+        base: MlpImageAdapter,
+        residual: MlpImageAdapter,
+        scale: f64,
+        token_gate_norm: LayerNorm,
+        token_gate: Linear,
+        keep_tokens: usize,
     },
 }
 
@@ -237,18 +246,36 @@ fn normalize_xtr_vectors(xs: &Tensor) -> Result<Tensor> {
 
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 impl XtrImageAdapter {
-    fn load(vb: VarBuilder, adapter_type: &str, residual_scale: Option<f64>) -> Result<Self> {
+    fn load(
+        vb: VarBuilder,
+        adapter_type: &str,
+        residual_scale: Option<f64>,
+        image_tokens: Option<usize>,
+    ) -> Result<Self> {
         match adapter_type {
             "gated_mlp" => Ok(Self::Gated {
                 mlp: MlpImageAdapter::load(vb.pp("net"), 256)?,
                 token_gate_norm: layer_norm(512, 1e-5, vb.pp("token_gate_norm"))?,
                 token_gate: linear(512, 1, vb.pp("token_gate"))?,
+                keep_tokens: image_tokens.unwrap_or(GATED_XTR_IMAGE_TOKENS),
             }),
             "residual_mlp" => Ok(Self::Residual {
                 base: MlpImageAdapter::load(vb.pp("base.net"), 256)?,
                 residual: MlpImageAdapter::load(vb.pp("residual"), 128)?,
                 scale: residual_scale.ok_or_else(|| {
                     Error::other("residual MobileCLIP2 XTR asset lacks residual_scale metadata")
+                })?,
+            }),
+            "residual_gated_mlp" => Ok(Self::ResidualGated {
+                base: MlpImageAdapter::load(vb.pp("base.net"), 256)?,
+                residual: MlpImageAdapter::load(vb.pp("residual"), 128)?,
+                scale: residual_scale.ok_or_else(|| {
+                    Error::other("residual MobileCLIP2 XTR asset lacks residual_scale metadata")
+                })?,
+                token_gate_norm: layer_norm(512, 1e-5, vb.pp("token_gate_norm"))?,
+                token_gate: linear(512, 1, vb.pp("token_gate"))?,
+                keep_tokens: image_tokens.ok_or_else(|| {
+                    Error::other("gated MobileCLIP2 XTR asset lacks image_tokens metadata")
                 })?,
             }),
             other => Err(Error::other(format!(
@@ -264,12 +291,13 @@ impl XtrImageAdapter {
                 mlp,
                 token_gate_norm,
                 token_gate,
+                keep_tokens,
             } => {
                 let xs = select_gated_tokens(
                     xs,
                     token_gate_norm,
                     token_gate,
-                    GATED_XTR_IMAGE_TOKENS,
+                    *keep_tokens,
                 )?;
                 mlp.forward(&xs)
             }
@@ -280,6 +308,23 @@ impl XtrImageAdapter {
             } => {
                 let base = normalize_xtr_vectors(&base.forward(xs)?)?;
                 base.broadcast_add(&(residual.forward(xs)? * *scale)?)
+            }
+            Self::ResidualGated {
+                base,
+                residual,
+                scale,
+                token_gate_norm,
+                token_gate,
+                keep_tokens,
+            } => {
+                let xs = select_gated_tokens(
+                    xs,
+                    token_gate_norm,
+                    token_gate,
+                    *keep_tokens,
+                )?;
+                let base = normalize_xtr_vectors(&base.forward(&xs)?)?;
+                base.broadcast_add(&(residual.forward(&xs)? * *scale)?)
             }
         }
     }
@@ -352,12 +397,22 @@ impl XtrImageEncoder {
             .map(|value| value.parse::<f64>())
             .transpose()
             .map_err(|e| Error::other(format!("invalid residual_scale metadata: {e}")))?;
+        let image_tokens = metadata
+            .and_then(|values| values.get("image_tokens"))
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
         let adapter_vb = VarBuilder::from_buffered_safetensors(
             adapter_bytes.to_vec(),
             DType::F32,
             device,
         )?;
-        let adapter = XtrImageAdapter::load(adapter_vb, adapter_type, residual_scale)?;
+        let adapter = XtrImageAdapter::load(
+            adapter_vb,
+            adapter_type,
+            residual_scale,
+            image_tokens,
+        )?;
         Ok(Self {
             vision_model,
             adapter,
@@ -367,7 +422,7 @@ impl XtrImageEncoder {
     }
 
     /// Return normalized-ready 96d patch vectors for a 512x512 image.
-    /// Gated legacy assets keep 128 tokens; residual assets keep all 256.
+    /// Gated assets keep the token count recorded in their metadata.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
         self.adapter
             .forward(&self.vision_model.forward_patches(pixel_values)?)

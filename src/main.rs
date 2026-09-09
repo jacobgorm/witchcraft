@@ -183,6 +183,7 @@ fn cosine_similarity(lhs: &candle_core::Tensor, rhs: &candle_core::Tensor) -> Re
     any(feature = "modernbert", feature = "modernbert-quantized")
 ))]
 fn maxsim_similarity(query: &candle_core::Tensor, image: &candle_core::Tensor) -> Result<f32> {
+    let image = image.to_device(query.device())?;
     let similarities = query.matmul(&image.transpose(0, 1)?)?;
     Ok(similarities.max(1)?.mean_all()?.to_scalar::<f32>()?)
 }

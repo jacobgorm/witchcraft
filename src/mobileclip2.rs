@@ -36,7 +36,7 @@ const IMAGE_DUMP_DIR_ENV: &str = "WARP_IMAGE_DUMP_DIR";
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 const XTR_IMAGE_SIZE: usize = 512;
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
-const XTR_IMAGE_TOKENS: usize = 128;
+const GATED_XTR_IMAGE_TOKENS: usize = 128;
 const DEFAULT_TEXT_WIDTH: usize = 512;
 const DEFAULT_TEXT_HEADS: usize = 8;
 const DEFAULT_TEXT_LAYERS: usize = 12;
@@ -193,55 +193,119 @@ pub struct T5EncoderModel {
 
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 #[derive(Clone, Debug)]
-struct XtrImageAdapter {
+struct MlpImageAdapter {
     norm: LayerNorm,
     fc1: Linear,
     fc2: Linear,
-    token_gate_norm: LayerNorm,
-    token_gate: Linear,
 }
 
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
-impl XtrImageAdapter {
-    fn load(vb: VarBuilder) -> Result<Self> {
-        let net = vb.pp("net");
-        let norm = layer_norm(512, 1e-5, net.pp(0))?;
-        let fc1 = linear(512, 256, net.pp(1))?;
-        let fc2 = linear_no_bias(256, 96, net.pp(3))?;
-        let token_gate_norm = layer_norm(512, 1e-5, vb.pp("token_gate_norm"))?;
-        let token_gate = linear(512, 1, vb.pp("token_gate"))?;
+impl MlpImageAdapter {
+    fn load(vb: VarBuilder, hidden: usize) -> Result<Self> {
         Ok(Self {
-            norm,
-            fc1,
-            fc2,
-            token_gate_norm,
-            token_gate,
+            norm: layer_norm(512, 1e-5, vb.pp(0))?,
+            fc1: linear(512, hidden, vb.pp(1))?,
+            fc2: linear_no_bias(hidden, 96, vb.pp(3))?,
         })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let xs = self.select_tokens(xs, XTR_IMAGE_TOKENS)?;
         self.fc2
-            .forward(&self.fc1.forward(&self.norm.forward(&xs)?)?.gelu_erf()?)
+            .forward(&self.fc1.forward(&self.norm.forward(xs)?)?.gelu_erf()?)
+    }
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+#[derive(Clone, Debug)]
+enum XtrImageAdapter {
+    Gated {
+        mlp: MlpImageAdapter,
+        token_gate_norm: LayerNorm,
+        token_gate: Linear,
+    },
+    Residual {
+        base: MlpImageAdapter,
+        residual: MlpImageAdapter,
+        scale: f64,
+    },
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+fn normalize_xtr_vectors(xs: &Tensor) -> Result<Tensor> {
+    xs.broadcast_div(&xs.sqr()?.sum_keepdim(2)?.sqrt()?)
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+impl XtrImageAdapter {
+    fn load(vb: VarBuilder, adapter_type: &str, residual_scale: Option<f64>) -> Result<Self> {
+        match adapter_type {
+            "gated_mlp" => Ok(Self::Gated {
+                mlp: MlpImageAdapter::load(vb.pp("net"), 256)?,
+                token_gate_norm: layer_norm(512, 1e-5, vb.pp("token_gate_norm"))?,
+                token_gate: linear(512, 1, vb.pp("token_gate"))?,
+            }),
+            "residual_mlp" => Ok(Self::Residual {
+                base: MlpImageAdapter::load(vb.pp("base.net"), 256)?,
+                residual: MlpImageAdapter::load(vb.pp("residual"), 128)?,
+                scale: residual_scale.ok_or_else(|| {
+                    Error::other("residual MobileCLIP2 XTR asset lacks residual_scale metadata")
+                })?,
+            }),
+            other => Err(Error::other(format!(
+                "unsupported MobileCLIP2 XTR adapter type `{other}`"
+            ))
+            .into()),
+        }
     }
 
-    fn select_tokens(&self, xs: &Tensor, keep_tokens: usize) -> Result<Tensor> {
-        let xs = xs.contiguous()?;
-        let (batch, tokens, width) = xs.dims3()?;
-        let keep = keep_tokens.min(tokens);
-        let gate_logits = self
-            .token_gate
-            .forward(&self.token_gate_norm.forward(&xs)?)?
-            .squeeze(2)?;
-        let indices = gate_logits
-            .contiguous()?
-            .arg_sort_last_dim(false)?
-            .narrow(1, 0, keep)?
-            .unsqueeze(2)?
-            .broadcast_as((batch, keep, width))?
-            .contiguous()?;
-        xs.gather(&indices, 1)
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Gated {
+                mlp,
+                token_gate_norm,
+                token_gate,
+            } => {
+                let xs = select_gated_tokens(
+                    xs,
+                    token_gate_norm,
+                    token_gate,
+                    GATED_XTR_IMAGE_TOKENS,
+                )?;
+                mlp.forward(&xs)
+            }
+            Self::Residual {
+                base,
+                residual,
+                scale,
+            } => {
+                let base = normalize_xtr_vectors(&base.forward(xs)?)?;
+                base.broadcast_add(&(residual.forward(xs)? * *scale)?)
+            }
+        }
     }
+}
+
+#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+fn select_gated_tokens(
+    xs: &Tensor,
+    token_gate_norm: &LayerNorm,
+    token_gate: &Linear,
+    keep_tokens: usize,
+) -> Result<Tensor> {
+    let xs = xs.contiguous()?;
+    let (batch, tokens, width) = xs.dims3()?;
+    let keep = keep_tokens.min(tokens);
+    let gate_logits = token_gate
+        .forward(&token_gate_norm.forward(&xs)?)?
+        .squeeze(2)?;
+    let indices = gate_logits
+        .contiguous()?
+        .arg_sort_last_dim(false)?
+        .narrow(1, 0, keep)?
+        .unsqueeze(2)?
+        .broadcast_as((batch, keep, width))?
+        .contiguous()?;
+    xs.gather(&indices, 1)
 }
 
 /// MobileCLIP2 vision tower followed by the trained ModernBERT-XTR adapter.
@@ -268,12 +332,32 @@ impl XtrImageEncoder {
         let adapter_bytes = XTR_ADAPTER
             .bytes(assets)
             .map_err(|_| Error::other("failed to read mobileclip2-xtr.safetensors"))?;
+        let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes)
+            .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR asset: {e}")))?;
+        let (_, header) = safetensors::SafeTensors::read_metadata(&adapter_bytes)
+            .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR metadata: {e}")))?;
+        let metadata = header.metadata().as_ref();
+        let adapter_type = metadata
+            .and_then(|values| values.get("adapter_type"))
+            .map(String::as_str)
+            .unwrap_or_else(|| {
+                if tensors.names().contains(&"base.net.0.weight") {
+                    "residual_mlp"
+                } else {
+                    "gated_mlp"
+                }
+            });
+        let residual_scale = metadata
+            .and_then(|values| values.get("residual_scale"))
+            .map(|value| value.parse::<f64>())
+            .transpose()
+            .map_err(|e| Error::other(format!("invalid residual_scale metadata: {e}")))?;
         let adapter_vb = VarBuilder::from_buffered_safetensors(
             adapter_bytes.to_vec(),
             DType::F32,
             device,
         )?;
-        let adapter = XtrImageAdapter::load(adapter_vb)?;
+        let adapter = XtrImageAdapter::load(adapter_vb, adapter_type, residual_scale)?;
         Ok(Self {
             vision_model,
             adapter,
@@ -282,8 +366,8 @@ impl XtrImageEncoder {
         })
     }
 
-    /// Return the 128 most salient normalized-ready 96d patch vectors for a
-    /// 512x512 image.
+    /// Return normalized-ready 96d patch vectors for a 512x512 image.
+    /// Gated legacy assets keep 128 tokens; residual assets keep all 256.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
         self.adapter
             .forward(&self.vision_model.forward_patches(pixel_values)?)

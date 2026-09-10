@@ -487,6 +487,29 @@ fn validate_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) ->
     Ok(())
 }
 
+#[cfg(feature = "mobileclip2")]
+fn image_paths_in_directory(directory: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    anyhow::ensure!(directory.is_dir(), "{} is not a directory", directory.display());
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| {
+                        matches!(
+                            extension.to_ascii_lowercase().as_str(),
+                            "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff"
+                        )
+                    })
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
 fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
 
@@ -549,6 +572,35 @@ fn main() -> Result<()> {
                 (rowid, count)
             };
             println!("embedded {count} image vectors for rowid {rowid}");
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image embedding requires building with --features mobileclip2");
+    } else if args.len() == 3 && &args[1] == "embedimages" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let paths = image_paths_in_directory(std::path::Path::new(&args[2]))?;
+            anyhow::ensure!(
+                !paths.is_empty(),
+                "no supported images found in {}",
+                args[2]
+            );
+            let device = witchcraft::make_device();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            let mut db = DB::new_fast(db_name)?;
+            let results = witchcraft::cache_image_embeddings_auto_many(
+                &mut db,
+                &embedder,
+                &paths,
+            )?;
+            let vector_count = results.iter().map(|(_, count)| count).sum::<usize>();
+            for (path, (rowid, count)) in paths.iter().zip(&results) {
+                println!("rowid {rowid}: {count} vectors for {}", path.display());
+            }
+            println!(
+                "embedded {} images as {vector_count} vectors; run `{} index` to index them",
+                results.len(),
+                args[0]
+            );
         }
         #[cfg(not(feature = "mobileclip2"))]
         anyhow::bail!("image embedding requires building with --features mobileclip2");
@@ -665,7 +717,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | embedimages <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

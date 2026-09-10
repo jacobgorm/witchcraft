@@ -133,7 +133,9 @@ pub use sqlite_index::{
     search_with_fulltext_prefix_wildcard, semantic_index_unavailable_reason,
 };
 #[cfg(all(feature = "sqlite", feature = "mobileclip2"))]
-pub use sqlite_index::{cache_image_embeddings, cache_image_embeddings_auto};
+pub use sqlite_index::{
+    cache_image_embeddings, cache_image_embeddings_auto, cache_image_embeddings_auto_many,
+};
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
 

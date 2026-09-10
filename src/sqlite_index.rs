@@ -1284,6 +1284,46 @@ pub fn cache_image_embeddings_auto(
     path: &std::path::Path,
 ) -> Result<(u64, usize)> {
     let embeddings = crate::compute_cached_image_embeddings(embedder, path)?;
+    cache_image_embeddings_auto_from_output(db, path, embeddings)
+}
+
+/// Encode and cache several images using batched vision-model forward passes.
+/// The returned rowids follow the input path order. This does not update the
+/// semantic index; call `index_chunks` once after embedding the desired batch.
+#[cfg(feature = "mobileclip2")]
+pub fn cache_image_embeddings_auto_many(
+    db: &mut DB,
+    embedder: &Embedder,
+    paths: &[std::path::PathBuf],
+) -> Result<Vec<(u64, usize)>> {
+    let batch_size = crate::embedder::embedding_batch_size();
+    let mut results = Vec::with_capacity(paths.len());
+    for batch_paths in paths.chunks(batch_size) {
+        let images = batch_paths
+            .iter()
+            .map(|path| crate::mobileclip2::load_image(path, embedder.image_size()))
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let batch = Tensor::stack(&images, 0)?;
+        let outputs = embedder.embed_image_tensor(&batch)?;
+        for (index, path) in batch_paths.iter().enumerate() {
+            let output = outputs.narrow(0, index, 1)?;
+            let embeddings = crate::cached_image_embeddings_from_output(output)?;
+            results.push(cache_image_embeddings_auto_from_output(
+                db,
+                path,
+                embeddings,
+            )?);
+        }
+    }
+    Ok(results)
+}
+
+#[cfg(feature = "mobileclip2")]
+fn cache_image_embeddings_auto_from_output(
+    db: &mut DB,
+    path: &std::path::Path,
+    embeddings: CachedEmbeddings,
+) -> Result<(u64, usize)> {
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let body = canonical_path.to_string_lossy();
     let existing_rowid = db

@@ -1291,11 +1291,15 @@ pub fn cache_image_embeddings_auto(
 /// The returned rowids follow the input path order. This does not update the
 /// semantic index; call `index_chunks` once after embedding the desired batch.
 #[cfg(feature = "mobileclip2")]
-pub fn cache_image_embeddings_auto_many(
+pub fn cache_image_embeddings_auto_many<F>(
     db: &mut DB,
     embedder: &Embedder,
     paths: &[std::path::PathBuf],
-) -> Result<Vec<(u64, usize)>> {
+    mut on_embedded: F,
+) -> Result<Vec<(u64, usize)>>
+where
+    F: FnMut(&std::path::Path, u64, usize),
+{
     // Eight 512x512 images keeps MobileCLIP2's intermediate activations at a
     // conservative size on Apple Silicon while still amortizing model launch.
     const IMAGE_EMBED_BATCH_SIZE: usize = 8;
@@ -1310,11 +1314,13 @@ pub fn cache_image_embeddings_auto_many(
         for (index, path) in batch_paths.iter().enumerate() {
             let output = outputs.narrow(0, index, 1)?;
             let embeddings = crate::cached_image_embeddings_from_output(output)?;
-            results.push(cache_image_embeddings_auto_from_output(
+            let result = cache_image_embeddings_auto_from_output(
                 db,
                 path,
                 embeddings,
-            )?);
+            )?;
+            on_embedded(path, result.0, result.1);
+            results.push(result);
         }
     }
     Ok(results)

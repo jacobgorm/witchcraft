@@ -591,11 +591,11 @@ fn main() -> Result<()> {
                 &mut db,
                 &embedder,
                 &paths,
+                |path, rowid, count| {
+                    println!("rowid {rowid}: {count} vectors for {}", path.display());
+                },
             )?;
             let vector_count = results.iter().map(|(_, count)| count).sum::<usize>();
-            for (path, (rowid, count)) in paths.iter().zip(&results) {
-                println!("rowid {rowid}: {count} vectors for {}", path.display());
-            }
             println!(
                 "embedded {} images as {vector_count} vectors; run `{} index` to index them",
                 results.len(),

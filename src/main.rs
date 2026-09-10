@@ -526,7 +526,7 @@ fn main() -> Result<()> {
         )
         .unwrap();
         println!("reindex: done");
-    } else if (args.len() == 3 || args.len() == 4) && &args[1] == "indeximage" {
+    } else if (args.len() == 3 || args.len() == 4) && &args[1] == "embedimage" {
         #[cfg(feature = "mobileclip2")]
         {
             let device = witchcraft::make_device();
@@ -548,16 +548,10 @@ fn main() -> Result<()> {
                 )?;
                 (rowid, count)
             };
-            witchcraft::index_chunks_with_options(
-                &db,
-                Some(&embedder),
-                false,
-                witchcraft::IndexOptions::default().force_flush(),
-            )?;
-            println!("indexed {count} image vectors for rowid {rowid}");
+            println!("embedded {count} image vectors for rowid {rowid}");
         }
         #[cfg(not(feature = "mobileclip2"))]
-        anyhow::bail!("image indexing requires building with --features mobileclip2");
+        anyhow::bail!("image embedding requires building with --features mobileclip2");
     } else if args.len() >= 3 && &args[1] == "saliency" {
         let device = witchcraft::make_device();
         let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
@@ -671,7 +665,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -1276,7 +1276,7 @@ pub fn cache_image_embeddings(
 }
 
 /// Register an image as a document using the database's normal rowid allocator,
-/// then cache its vectors. Re-indexing the same canonical path reuses its rowid.
+/// then cache its vectors. Re-embedding the same canonical path reuses its rowid.
 #[cfg(feature = "mobileclip2")]
 pub fn cache_image_embeddings_auto(
     db: &mut DB,

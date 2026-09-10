@@ -33,13 +33,16 @@ def download(url: str) -> bytes:
 
 def main() -> None:
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    cities = OUTPUT / "cities15000.txt"
+    cities = OUTPUT / "cities5000.txt"
     countries = OUTPUT / "countryInfo.txt"
+    regions = OUTPUT / "admin1CodesASCII.txt"
     if not cities.exists():
-        archive = ZipFile(io.BytesIO(download(f"{BASE}/cities15000.zip")))
-        cities.write_bytes(archive.read("cities15000.txt"))
+        archive = ZipFile(io.BytesIO(download(f"{BASE}/cities5000.zip")))
+        cities.write_bytes(archive.read("cities5000.txt"))
     if not countries.exists():
         countries.write_bytes(download(f"{BASE}/countryInfo.txt"))
+    if not regions.exists():
+        regions.write_bytes(download(f"{BASE}/admin1CodesASCII.txt"))
     (OUTPUT / "README.txt").write_text(
         "GeoNames data is licensed under CC BY 4.0.\n"
         "Source: https://www.geonames.org/\n",

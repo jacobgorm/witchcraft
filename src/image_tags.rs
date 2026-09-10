@@ -29,7 +29,11 @@ pub struct ImageTags {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nearest_town: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nearby_towns: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearest_town_distance_km: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,7 +65,9 @@ impl Default for ImageTags {
             altitude_m: None,
             country_code: None,
             country: None,
+            region: None,
             nearest_town: None,
+            nearby_towns: Vec::new(),
             nearest_town_distance_km: None,
             season: None,
             time_of_day: None,
@@ -79,7 +85,10 @@ impl Default for ImageTags {
 struct City {
     name: String,
     country_code: String,
+    admin1_code: String,
     timezone: Option<String>,
+    feature_code: String,
+    population: u64,
     latitude: f64,
     longitude: f64,
     unit: [f64; 3],
@@ -89,6 +98,7 @@ struct City {
 struct GeoIndex {
     cities: Vec<City>,
     countries: HashMap<String, String>,
+    regions: HashMap<String, String>,
 }
 
 static GEO_CACHE: Lazy<RwLock<HashMap<PathBuf, Arc<GeoIndex>>>> = Lazy::new(|| RwLock::new(HashMap::new()));
@@ -102,8 +112,9 @@ fn unit_position(latitude: f64, longitude: f64) -> [f64; 3] {
 impl GeoIndex {
     fn load(assets: &Path) -> Result<Self> {
         let root = assets.join("geonames");
-        let cities_path = root.join("cities15000.txt");
+        let cities_path = root.join("cities5000.txt");
         let countries_path = root.join("countryInfo.txt");
+        let regions_path = root.join("admin1CodesASCII.txt");
         let mut countries = HashMap::new();
         for line in
             BufReader::new(File::open(&countries_path).with_context(|| format!("open {}", countries_path.display()))?)
@@ -116,6 +127,18 @@ impl GeoIndex {
             let fields: Vec<&str> = line.split('\t').collect();
             if fields.len() > 4 {
                 countries.insert(fields[0].to_string(), fields[4].to_string());
+            }
+        }
+
+        let mut regions = HashMap::new();
+        for line in
+            BufReader::new(File::open(&regions_path).with_context(|| format!("open {}", regions_path.display()))?)
+                .lines()
+        {
+            let line = line?;
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() >= 2 {
+                regions.insert(fields[0].to_string(), fields[1].to_string());
             }
         }
 
@@ -140,30 +163,71 @@ impl GeoIndex {
             let Ok(longitude) = fields[5].parse::<f64>() else {
                 continue;
             };
+            let population = fields[14].parse::<u64>().unwrap_or(0);
             cities.push(City {
                 name: fields[1].to_string(),
                 country_code: fields[8].to_string(),
+                admin1_code: fields[10].to_string(),
                 timezone: fields
                     .get(17)
                     .filter(|value| !value.is_empty())
                     .map(|value| value.to_string()),
+                feature_code: fields[7].to_string(),
+                population,
                 latitude,
                 longitude,
                 unit: unit_position(latitude, longitude),
             });
         }
         anyhow::ensure!(!cities.is_empty(), "GeoNames city database is empty");
-        Ok(Self { cities, countries })
+        Ok(Self {
+            cities,
+            countries,
+            regions,
+        })
     }
 
-    fn nearest_city(&self, latitude: f64, longitude: f64) -> Option<(&City, f64)> {
+    fn nearby_cities(&self, latitude: f64, longitude: f64) -> Option<Vec<(&City, f64)>> {
         let query = unit_position(latitude, longitude);
-        let city = self.cities.iter().max_by(|left, right| {
-            let left_dot = left.unit[0] * query[0] + left.unit[1] * query[1] + left.unit[2] * query[2];
-            let right_dot = right.unit[0] * query[0] + right.unit[1] * query[1] + right.unit[2] * query[2];
-            left_dot.total_cmp(&right_dot)
-        })?;
-        Some((city, haversine_km(latitude, longitude, city.latitude, city.longitude)))
+        let city = self
+            .cities
+            .iter()
+            .filter(|city| city.population >= 15_000)
+            .max_by(|left, right| {
+                let left_dot = left.unit[0] * query[0] + left.unit[1] * query[1] + left.unit[2] * query[2];
+                let right_dot = right.unit[0] * query[0] + right.unit[1] * query[1] + right.unit[2] * query[2];
+                left_dot.total_cmp(&right_dot)
+            })?;
+        let distance = haversine_km(latitude, longitude, city.latitude, city.longitude);
+        let mut result = vec![(city, distance)];
+        if distance < 10.0 {
+            return Some(result);
+        }
+
+        let radius_km = (distance * 2.0).max(50.0);
+        let mut alternatives: Vec<(&City, f64)> = self
+            .cities
+            .iter()
+            .filter(|candidate| {
+                candidate.name != city.name
+                    && candidate.country_code == city.country_code
+                    && candidate.feature_code != "PPL"
+                    && candidate.population >= 10_000
+            })
+            .filter_map(|candidate| {
+                let distance = haversine_km(latitude, longitude, candidate.latitude, candidate.longitude);
+                (distance <= radius_km).then_some((candidate, distance))
+            })
+            .collect();
+        alternatives.sort_by(|left, right| {
+            right
+                .0
+                .population
+                .cmp(&left.0.population)
+                .then_with(|| left.1.total_cmp(&right.1))
+        });
+        result.extend(alternatives.into_iter().take(2));
+        Some(result)
     }
 }
 
@@ -370,12 +434,20 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 fn build_search_text(tags: &ImageTags) -> Option<String> {
-    let mut parts = vec!["Photograph".to_string()];
-    match (&tags.nearest_town, &tags.country) {
-        (Some(town), Some(country)) => parts.push(format!("taken near {town}, {country}")),
-        (Some(town), None) => parts.push(format!("taken near {town}")),
-        (None, Some(country)) => parts.push(format!("taken in {country}")),
-        (None, None) => {},
+    let mut parts = vec!["Photo".to_string()];
+    let area = match (&tags.region, &tags.country) {
+        (Some(region), Some(country)) if region != country => Some(format!("{region}, {country}")),
+        (_, Some(country)) => Some(country.clone()),
+        (Some(region), None) => Some(region.clone()),
+        (None, None) => None,
+    };
+    match (tags.nearby_towns.as_slice(), &tags.nearest_town, area) {
+        (towns, _, Some(area)) if towns.len() > 1 => parts.push(format!("taken near {} in {area}", human_list(towns))),
+        (towns, _, None) if towns.len() > 1 => parts.push(format!("taken near {}", human_list(towns))),
+        (_, Some(town), Some(area)) => parts.push(format!("taken near {town}, {area}")),
+        (_, Some(town), None) => parts.push(format!("taken near {town}")),
+        (_, None, Some(area)) => parts.push(format!("taken in {area}")),
+        (_, None, None) => {},
     }
     if let Some(season) = &tags.season {
         parts.push(format!("during {season}"));
@@ -417,6 +489,22 @@ fn build_search_text(tags: &ImageTags) -> Option<String> {
     (parts.len() > 1).then(|| format!("{}.", parts.join(" ")))
 }
 
+fn human_list(values: &[String]) -> String {
+    match values {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [first, middle @ .., last] => format!(
+            "{}, and {last}",
+            std::iter::once(first)
+                .chain(middle)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 pub fn extract(path: &Path, assets: &Path) -> Result<ImageTags> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -428,17 +516,24 @@ pub fn extract(path: &Path, assets: &Path) -> Result<ImageTags> {
     let latitude = gps_coordinate(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef);
     let longitude = gps_coordinate(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef);
     let nearest = match (latitude, longitude, geo_index(assets)) {
-        (Some(latitude), Some(longitude), Some(index)) => {
-            index.nearest_city(latitude, longitude).map(|(city, distance)| {
-                (
-                    city.name.clone(),
-                    city.country_code.clone(),
-                    city.timezone.clone(),
-                    index.countries.get(&city.country_code).cloned(),
-                    distance,
-                )
-            })
-        },
+        (Some(latitude), Some(longitude), Some(index)) => index.nearby_cities(latitude, longitude).map(|cities| {
+            let (city, distance) = cities[0];
+            (
+                city.name.clone(),
+                city.country_code.clone(),
+                city.timezone.clone(),
+                index.countries.get(&city.country_code).cloned(),
+                index
+                    .regions
+                    .get(&format!("{}.{}", city.country_code, city.admin1_code))
+                    .cloned(),
+                distance,
+                cities
+                    .into_iter()
+                    .map(|(city, _)| city.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        }),
         _ => None,
     };
     let timezone = nearest.as_ref().and_then(|nearest| nearest.2.as_deref());
@@ -455,10 +550,12 @@ pub fn extract(path: &Path, assets: &Path) -> Result<ImageTags> {
         lens_model: ascii_field(&exif, Tag::LensModel),
         ..ImageTags::default()
     };
-    if let Some((town, country_code, _timezone, country, distance)) = nearest {
+    if let Some((town, country_code, _timezone, country, region, distance, nearby_towns)) = nearest {
         tags.country_code = Some(country_code);
         tags.country = country;
+        tags.region = region;
         tags.nearest_town = Some(town);
+        tags.nearby_towns = nearby_towns;
         tags.nearest_town_distance_km = Some(distance);
     }
     if let Some(local_time) = local_time {
@@ -520,7 +617,9 @@ mod tests {
         let tags = ImageTags {
             version: TAG_VERSION,
             country: Some("Denmark".to_string()),
+            region: Some("Region Zealand".to_string()),
             nearest_town: Some("Roskilde".to_string()),
+            nearby_towns: vec!["Roskilde".to_string(), "Køge".to_string(), "Holbæk".to_string()],
             season: Some("winter".to_string()),
             time_of_day: Some("evening".to_string()),
             solar_phase: Some("civil twilight".to_string()),
@@ -528,9 +627,18 @@ mod tests {
             ..ImageTags::default()
         };
         let text = build_search_text(&tags).unwrap();
-        assert!(text.contains("Roskilde"));
+        assert!(text.starts_with("Photo taken near Roskilde, Køge, and Holbæk in Region Zealand, Denmark"));
         assert!(text.contains("winter"));
         assert!(text.contains("evening"));
         assert!(text.contains("42 metres"));
+    }
+
+    #[test]
+    fn nearby_town_lists_use_natural_conjunctions() {
+        assert_eq!(human_list(&["Randers".into(), "Aarhus".into()]), "Randers and Aarhus");
+        assert_eq!(
+            human_list(&["Randers".into(), "Aarhus".into(), "Grenaa".into()]),
+            "Randers, Aarhus, and Grenaa"
+        );
     }
 }

@@ -98,6 +98,8 @@ make geotag-assets
 The MobileCLIP2 visual tokens and ModernBERT metadata tokens form one unified
 multi-vector XTR document. Country, nearest large town, season, solar-aware
 morning/daytime/evening/night, elevation, date, and camera tags are searchable.
+When an image is not close to a large town, the text includes up to three nearby
+towns as well as the state or region when GeoNames provides one.
 Images already carrying visual vectors are enriched without rerunning
 MobileCLIP2. Structured values are also stored under `$.image` in document
 metadata.

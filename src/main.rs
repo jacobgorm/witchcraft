@@ -4,7 +4,10 @@ use log::{Level, LevelFilter, Metadata, Record};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use text_splitter::TextSplitter;
 use uuid::Uuid;
 
@@ -487,24 +490,114 @@ fn validate_semantic_search(db: &DB, embedder: Option<&witchcraft::Embedder>) ->
     Ok(())
 }
 
+fn is_supported_image_path(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff"
+                )
+            })
+            .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminal_dimensions() -> Option<(u16, u16)> {
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let size = unsafe { size.assume_init() };
+    (size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
+}
+
+#[cfg(not(unix))]
+fn terminal_dimensions() -> Option<(u16, u16)> {
+    None
+}
+
+fn display_image_grid(paths: &[PathBuf]) {
+    if paths.is_empty() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let viu_available = Command::new("viu")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !viu_available {
+        return;
+    }
+
+    let (terminal_width, terminal_height) = terminal_dimensions().unwrap_or((120, 40));
+    let cell_width = (terminal_width / 3).max(1);
+    let grid_height = terminal_height.saturating_sub(2).max(3);
+    let cell_height = (grid_height / 3).max(1);
+
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    for (index, path) in paths.iter().take(9).enumerate() {
+        let column = index % 3;
+        let row = index / 3;
+        let child = Command::new("viu")
+            .args([
+                "-a",
+                "-x",
+                &(column * cell_width as usize).to_string(),
+                "-y",
+                &(row * cell_height as usize).to_string(),
+                "-w",
+                &cell_width.to_string(),
+                "-h",
+                &cell_height.to_string(),
+                "-s",
+            ])
+            .arg(path)
+            .spawn();
+        let Ok(mut child) = child else {
+            return;
+        };
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!("warning: viu could not display {}", path.display());
+                    }
+                    break;
+                }
+                Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("warning: viu timed out; skipping image grid");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("warning: could not wait for viu: {error}");
+                    return;
+                }
+            }
+        }
+    }
+    print!("\x1b[{};1H", grid_height.saturating_add(1));
+    let _ = std::io::stdout().flush();
+}
+
 #[cfg(feature = "mobileclip2")]
 fn image_paths_in_directory(directory: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     anyhow::ensure!(directory.is_dir(), "{} is not a directory", directory.display());
     let mut paths = std::fs::read_dir(directory)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| {
-                        matches!(
-                            extension.to_ascii_lowercase().as_str(),
-                            "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff"
-                        )
-                    })
-                    .unwrap_or(false)
-        })
+        .filter(|path| is_supported_image_path(path))
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)
@@ -683,13 +776,22 @@ fn main() -> Result<()> {
         witchcraft::reset_bucket_io_counters();
         let results =
             witchcraft::search(&db, embedder.as_ref(), &mut cache, q, 0.0, 10, use_fulltext, None).unwrap();
+        let mut image_paths = Vec::new();
         for (score, _metadata, bodies, sub_idx, _date) in results {
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let body = &bodies[idx];
             println!("{score}: {body} @ {sub_idx}");
             println!("=============================================");
+            let path = PathBuf::from(body);
+            if image_paths.len() < 9
+                && is_supported_image_path(&path)
+                && !image_paths.contains(&path)
+            {
+                image_paths.push(path);
+            }
         }
         witchcraft::log_bucket_io_counters();
+        display_image_grid(&image_paths);
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv" || args[1] == "exactcsv")
     {

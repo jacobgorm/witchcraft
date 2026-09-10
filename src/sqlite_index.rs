@@ -1296,9 +1296,11 @@ pub fn cache_image_embeddings_auto_many(
     embedder: &Embedder,
     paths: &[std::path::PathBuf],
 ) -> Result<Vec<(u64, usize)>> {
-    let batch_size = crate::embedder::embedding_batch_size();
+    // Eight 512x512 images keeps MobileCLIP2's intermediate activations at a
+    // conservative size on Apple Silicon while still amortizing model launch.
+    const IMAGE_EMBED_BATCH_SIZE: usize = 8;
     let mut results = Vec::with_capacity(paths.len());
-    for batch_paths in paths.chunks(batch_size) {
+    for batch_paths in paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
         let images = batch_paths
             .iter()
             .map(|path| crate::mobileclip2::load_image(path, embedder.image_size()))

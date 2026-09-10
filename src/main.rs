@@ -520,6 +520,51 @@ fn terminal_dimensions() -> Option<(u16, u16)> {
     None
 }
 
+#[cfg(feature = "mobileclip2")]
+fn image_contact_sheet(
+    paths: &[PathBuf],
+    cell_width: u16,
+    cell_height: u16,
+) -> Result<tempfile::NamedTempFile> {
+    const COLUMN_PIXELS: u32 = 8;
+    const ROW_PIXELS: u32 = 16;
+    const TILE_PADDING: u32 = 4;
+
+    let tile_width = u32::from(cell_width).saturating_mul(COLUMN_PIXELS).max(16);
+    let tile_height = u32::from(cell_height).saturating_mul(ROW_PIXELS).max(16);
+    let mut sheet = image::RgbaImage::from_pixel(
+        tile_width.saturating_mul(3),
+        tile_height.saturating_mul(3),
+        image::Rgba([0, 0, 0, 255]),
+    );
+    for (index, path) in paths.iter().take(9).enumerate() {
+        let decoded = match image::ImageReader::open(path)
+            .and_then(|reader| reader.with_guessed_format())
+            .map_err(anyhow::Error::from)
+            .and_then(|reader| reader.decode().map_err(anyhow::Error::from))
+        {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                eprintln!("warning: could not display {}: {error}", path.display());
+                continue;
+            }
+        };
+        let available_width = tile_width.saturating_sub(TILE_PADDING.saturating_mul(2));
+        let available_height = tile_height.saturating_sub(TILE_PADDING.saturating_mul(2));
+        let thumbnail = decoded.thumbnail(available_width, available_height).to_rgba8();
+        let column = (index % 3) as u32;
+        let row = (index / 3) as u32;
+        let x = column * tile_width + (tile_width - thumbnail.width()) / 2;
+        let y = row * tile_height + (tile_height - thumbnail.height()) / 2;
+        image::imageops::overlay(&mut sheet, &thumbnail, i64::from(x), i64::from(y));
+    }
+
+    let file = tempfile::Builder::new().suffix(".png").tempfile()?;
+    sheet.save(file.path())?;
+    Ok(file)
+}
+
+#[cfg(feature = "mobileclip2")]
 fn display_image_grid(paths: &[PathBuf]) {
     if paths.is_empty() || !std::io::stdout().is_terminal() {
         return;
@@ -547,54 +592,55 @@ fn display_image_grid(paths: &[PathBuf]) {
         .max(3);
     let cell_width = (grid_width / 3).max(1);
     let cell_height = (grid_height / 3).max(1);
+    let sheet = match image_contact_sheet(paths, cell_width, cell_height) {
+        Ok(sheet) => sheet,
+        Err(error) => {
+            eprintln!("warning: could not build image grid: {error}");
+            return;
+        }
+    };
 
     print!("\x1b[2J\x1b[H");
     let _ = std::io::stdout().flush();
-    for (index, path) in paths.iter().take(9).enumerate() {
-        let column = index % 3;
-        let row = index / 3;
-        let x = horizontal_margin as usize + column * cell_width as usize;
-        let y = top_margin as usize + row * cell_height as usize;
-        let child = Command::new("viu")
-            .args([
-                "-a",
-                "-x",
-                &x.to_string(),
-                "-y",
-                &y.to_string(),
-                "-w",
-                &cell_width.to_string(),
-                "-h",
-                &cell_height.to_string(),
-                "-s",
-            ])
-            .arg(path)
-            .spawn();
-        let Ok(mut child) = child else {
-            return;
-        };
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        eprintln!("warning: viu could not display {}", path.display());
-                    }
-                    break;
+    let child = Command::new("viu")
+        .args([
+            "-a",
+            "-x",
+            &horizontal_margin.to_string(),
+            "-y",
+            &top_margin.to_string(),
+            "-w",
+            &grid_width.to_string(),
+            "-h",
+            &grid_height.to_string(),
+            "-s",
+        ])
+        .arg(sheet.path())
+        .spawn();
+    let Ok(mut child) = child else {
+        return;
+    };
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!("warning: viu could not display image grid");
                 }
-                Ok(None) if started.elapsed() < Duration::from_secs(2) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    eprintln!("warning: viu timed out; skipping image grid");
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("warning: could not wait for viu: {error}");
-                    return;
-                }
+                break;
+            }
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("warning: viu timed out; skipping image grid");
+                return;
+            }
+            Err(error) => {
+                eprintln!("warning: could not wait for viu: {error}");
+                return;
             }
         }
     }
@@ -605,6 +651,9 @@ fn display_image_grid(paths: &[PathBuf]) {
     print!("\x1b[{cursor_row};1H");
     let _ = std::io::stdout().flush();
 }
+
+#[cfg(not(feature = "mobileclip2"))]
+fn display_image_grid(_paths: &[PathBuf]) {}
 
 #[cfg(feature = "mobileclip2")]
 fn image_paths_in_directory(directory: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {

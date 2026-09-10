@@ -2,10 +2,12 @@
 """Export an xtrbert MobileCLIP2 adapter checkpoint for Witchcraft."""
 
 import argparse
+import os
 from pathlib import Path
 
 import torch
-from safetensors.torch import save_file
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 
 
 GATED_MLP_EXPECTED = {
@@ -56,12 +58,22 @@ def main() -> None:
         type=int,
         help="Number of gated image tokens to export; defaults to export_image_tokens",
     )
+    parser.add_argument(
+        "--vision-base",
+        default="assets/mobileclip2.safetensors",
+        help="Stock full MobileCLIP2 weights to receive fine-tuned vision tensors",
+    )
+    parser.add_argument(
+        "--vision-output",
+        help="Write merged full MobileCLIP2 weights here when the checkpoint contains them",
+    )
     args = parser.parse_args()
 
     checkpoint = Path(args.checkpoint)
     if checkpoint.is_dir():
         checkpoint = checkpoint / "mobileclip2_modernbert.pt"
-    state = torch.load(checkpoint, map_location="cpu", weights_only=True)["adapter"]
+    checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    state = checkpoint_state["adapter"]
     shapes = {key: tuple(value.shape) for key, value in state.items()}
     config = {}
     config_path = checkpoint.parent / "config.json"
@@ -116,6 +128,41 @@ def main() -> None:
         metadata=metadata,
     )
     print(f"wrote {output} ({adapter_type}, {image_tokens} tokens)")
+
+    vision_state = checkpoint_state.get("image_visual")
+    if vision_state is not None:
+        if not args.vision_output:
+            raise ValueError(
+                "checkpoint contains fine-tuned vision weights; pass --vision-output"
+            )
+        vision_base = Path(args.vision_base)
+        vision_output = Path(args.vision_output)
+        full_state = load_file(vision_base, device="cpu")
+        replacements = {f"visual.{key}": value for key, value in vision_state.items()}
+        missing = sorted(set(replacements) - set(full_state))
+        mismatched = sorted(
+            key
+            for key, value in replacements.items()
+            if key in full_state and tuple(value.shape) != tuple(full_state[key].shape)
+        )
+        if missing or mismatched:
+            raise ValueError(
+                f"fine-tuned vision tensors do not match base model: "
+                f"missing={missing}, shape_mismatch={mismatched}"
+            )
+        full_state.update(
+            {key: value.contiguous() for key, value in replacements.items()}
+        )
+        with safe_open(vision_base, framework="pt", device="cpu") as source:
+            vision_metadata = source.metadata()
+        vision_output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = vision_output.with_name(f".{vision_output.name}.tmp")
+        save_file(full_state, temporary, metadata=vision_metadata)
+        os.replace(temporary, vision_output)
+        print(
+            f"wrote {vision_output} "
+            f"({len(replacements)} fine-tuned vision tensors)"
+        )
 
 
 if __name__ == "__main__":

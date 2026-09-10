@@ -575,14 +575,23 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "mobileclip2"))]
         anyhow::bail!("image embedding requires building with --features mobileclip2");
-    } else if args.len() == 3 && &args[1] == "embedimages" {
+    } else if (args.len() == 3 || args.len() == 4) && &args[1] == "embedimages" {
         #[cfg(feature = "mobileclip2")]
         {
-            let paths = image_paths_in_directory(std::path::Path::new(&args[2]))?;
+            let (force, directory) = if args.len() == 4 {
+                anyhow::ensure!(
+                    args[2] == "--force",
+                    "expected --force before the image directory"
+                );
+                (true, &args[3])
+            } else {
+                (false, &args[2])
+            };
+            let paths = image_paths_in_directory(std::path::Path::new(directory))?;
             anyhow::ensure!(
                 !paths.is_empty(),
                 "no supported images found in {}",
-                args[2]
+                directory
             );
             let device = witchcraft::make_device();
             let embedder = witchcraft::Embedder::new(&device, &assets)?;
@@ -591,6 +600,7 @@ fn main() -> Result<()> {
                 &mut db,
                 &embedder,
                 &paths,
+                force,
                 |path, rowid, count| {
                     println!("rowid {rowid}: {count} vectors for {}", path.display());
                 },
@@ -718,7 +728,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | embedimages <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -1295,6 +1295,7 @@ pub fn cache_image_embeddings_auto_many<F>(
     db: &mut DB,
     embedder: &Embedder,
     paths: &[std::path::PathBuf],
+    force: bool,
     mut on_embedded: F,
 ) -> Result<Vec<(u64, usize)>>
 where
@@ -1303,8 +1304,21 @@ where
     // Eight 512x512 images keeps MobileCLIP2's intermediate activations at a
     // conservative size on Apple Silicon while still amortizing model launch.
     const IMAGE_EMBED_BATCH_SIZE: usize = 8;
+    let mut pending_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !force {
+            if let Some(rowid) = cached_image_rowid(db, path)? {
+                log::info!(
+                    "skipping already embedded image rowid {rowid}: {}",
+                    path.display()
+                );
+                continue;
+            }
+        }
+        pending_paths.push(path.clone());
+    }
     let mut results = Vec::with_capacity(paths.len());
-    for batch_paths in paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
+    for batch_paths in pending_paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
         let mut valid_paths = Vec::with_capacity(batch_paths.len());
         let mut images = Vec::with_capacity(batch_paths.len());
         for path in batch_paths {
@@ -1336,6 +1350,23 @@ where
         }
     }
     Ok(results)
+}
+
+#[cfg(feature = "mobileclip2")]
+fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let body = canonical_path.to_string_lossy();
+    db.query(
+        "SELECT document.rowid
+         FROM document JOIN chunk ON document.hash = chunk.hash
+         WHERE document.body = ?1 AND chunk.embedding_count > 0
+         LIMIT 1",
+    )?
+    .query_row((body.as_ref(),), |row| row.get::<_, i64>(0))
+    .optional()?
+    .map(u64::try_from)
+    .transpose()
+    .map_err(Into::into)
 }
 
 #[cfg(feature = "mobileclip2")]

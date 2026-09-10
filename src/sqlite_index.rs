@@ -1305,13 +1305,25 @@ where
     const IMAGE_EMBED_BATCH_SIZE: usize = 8;
     let mut results = Vec::with_capacity(paths.len());
     for batch_paths in paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
-        let images = batch_paths
-            .iter()
-            .map(|path| crate::mobileclip2::load_image(path, embedder.image_size()))
-            .collect::<candle_core::Result<Vec<_>>>()?;
+        let mut valid_paths = Vec::with_capacity(batch_paths.len());
+        let mut images = Vec::with_capacity(batch_paths.len());
+        for path in batch_paths {
+            match crate::mobileclip2::load_image(path, embedder.image_size()) {
+                Ok(image) => {
+                    valid_paths.push(path);
+                    images.push(image);
+                }
+                Err(error) => {
+                    log::warn!("skipping image {}: {error}", path.display());
+                }
+            }
+        }
+        if images.is_empty() {
+            continue;
+        }
         let batch = Tensor::stack(&images, 0)?;
         let outputs = embedder.embed_image_tensor(&batch)?;
-        for (index, path) in batch_paths.iter().enumerate() {
+        for (index, path) in valid_paths.into_iter().enumerate() {
             let output = outputs.narrow(0, index, 1)?;
             let embeddings = crate::cached_image_embeddings_from_output(output)?;
             let result = cache_image_embeddings_auto_from_output(

@@ -596,8 +596,9 @@ fn main() -> Result<()> {
                 },
             )?;
             let vector_count = results.iter().map(|(_, count)| count).sum::<usize>();
+            let skipped = paths.len() - results.len();
             println!(
-                "embedded {} images as {vector_count} vectors; run `{} index` to index them",
+                "embedded {} images as {vector_count} vectors, skipped {skipped}; run `{} index` to index them",
                 results.len(),
                 args[0]
             );

@@ -536,8 +536,16 @@ fn display_image_grid(paths: &[PathBuf]) {
     }
 
     let (terminal_width, terminal_height) = terminal_dimensions().unwrap_or((120, 40));
-    let cell_width = (terminal_width / 3).max(1);
-    let grid_height = terminal_height.saturating_sub(2).max(3);
+    let horizontal_margin = 2u16;
+    let top_margin = 1u16;
+    let bottom_margin = 4u16;
+    let grid_width = terminal_width
+        .saturating_sub(horizontal_margin.saturating_mul(2))
+        .max(3);
+    let grid_height = terminal_height
+        .saturating_sub(top_margin.saturating_add(bottom_margin))
+        .max(3);
+    let cell_width = (grid_width / 3).max(1);
     let cell_height = (grid_height / 3).max(1);
 
     print!("\x1b[2J\x1b[H");
@@ -545,13 +553,15 @@ fn display_image_grid(paths: &[PathBuf]) {
     for (index, path) in paths.iter().take(9).enumerate() {
         let column = index % 3;
         let row = index / 3;
+        let x = horizontal_margin as usize + column * cell_width as usize;
+        let y = top_margin as usize + row * cell_height as usize;
         let child = Command::new("viu")
             .args([
                 "-a",
                 "-x",
-                &(column * cell_width as usize).to_string(),
+                &x.to_string(),
                 "-y",
-                &(row * cell_height as usize).to_string(),
+                &y.to_string(),
                 "-w",
                 &cell_width.to_string(),
                 "-h",
@@ -588,7 +598,11 @@ fn display_image_grid(paths: &[PathBuf]) {
             }
         }
     }
-    print!("\x1b[{};1H", grid_height.saturating_add(1));
+    let cursor_row = top_margin
+        .saturating_add(cell_height.saturating_mul(3))
+        .saturating_add(1)
+        .min(terminal_height.saturating_sub(1).max(1));
+    print!("\x1b[{cursor_row};1H");
     let _ = std::io::stdout().flush();
 }
 

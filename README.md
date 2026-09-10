@@ -82,6 +82,26 @@ variations of this, instead of "query" you can also use "hybrid", which
 combines semantic search with the BM25 search functionality that comes
 standard with sqlite.
 
+## Offline image location and time tags
+
+MobileCLIP2/ModernBERT builds can enrich image embeddings with EXIF-derived
+search text. Install the small offline GeoNames database once, then embed or
+enrich a directory and update the index:
+
+```
+make geotag-assets
+./warp-cli imagetags path/to/photo.jpg
+./warp-cli embedimages path/to/photos
+./warp-cli index
+```
+
+The MobileCLIP2 visual tokens and ModernBERT metadata tokens form one unified
+multi-vector XTR document. Country, nearest large town, season, solar-aware
+morning/daytime/evening/night, elevation, date, and camera tags are searchable.
+Images already carrying visual vectors are enriched without rerunning
+MobileCLIP2. Structured values are also stored under `$.image` in document
+metadata.
+
 # Pickbrain: semantic search over your AI coding sessions #
 
 Included as an example is **pickbrain** (screenshot above), a CLI that indexes

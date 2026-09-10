@@ -705,6 +705,14 @@ fn main() -> Result<()> {
         )
         .unwrap();
         println!("reindex: done");
+    } else if args.len() == 3 && &args[1] == "imagetags" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let tags = witchcraft::image_tags::extract(std::path::Path::new(&args[2]), &assets)?;
+            println!("{}", serde_json::to_string_pretty(&tags)?);
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image tags require building with --features mobileclip2");
     } else if (args.len() == 3 || args.len() == 4) && &args[1] == "embedimage" {
         #[cfg(feature = "mobileclip2")]
         {
@@ -764,7 +772,7 @@ fn main() -> Result<()> {
             let vector_count = results.iter().map(|(_, count)| count).sum::<usize>();
             let skipped = paths.len() - results.len();
             println!(
-                "embedded {} images as {vector_count} vectors, skipped {skipped}; run `{} index` to index them",
+                "embedded or enriched {} images as {vector_count} vectors, skipped {skipped}; run `{} index` to index them",
                 results.len(),
                 args[0]
             );
@@ -893,7 +901,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -10,6 +10,11 @@ use crate::{
     query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr, Embedder,
     EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings, SqlStatementInternal, DB,
 };
+#[cfg(all(
+    feature = "mobileclip2",
+    any(feature = "modernbert", feature = "modernbert-quantized")
+))]
+use crate::compute_cached_embeddings;
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use log::{debug, info};
@@ -1257,6 +1262,83 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     embed_chunks_with_cache(db, embedder, &cache, limit)
 }
 
+#[cfg(feature = "mobileclip2")]
+fn image_tags_for_path(
+    path: &std::path::Path,
+    assets: &std::path::Path,
+) -> crate::image_tags::ImageTags {
+    match crate::image_tags::extract(path, assets) {
+        Ok(tags) => tags,
+        Err(error) => {
+            log::warn!("could not read EXIF tags from {}: {error}", path.display());
+            crate::image_tags::ImageTags::default()
+        }
+    }
+}
+
+#[cfg(feature = "mobileclip2")]
+fn image_metadata(path: &str, tags: &crate::image_tags::ImageTags) -> String {
+    serde_json::json!({ "key": path, "image": tags }).to_string()
+}
+
+#[cfg(feature = "mobileclip2")]
+fn update_image_metadata(
+    db: &DB,
+    rowid: u64,
+    path: &std::path::Path,
+    tags: &crate::image_tags::ImageTags,
+) -> Result<()> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let metadata = image_metadata(path.to_string_lossy().as_ref(), tags);
+    db.query("UPDATE document SET metadata = ?1 WHERE rowid = ?2")?
+        .execute((metadata, i64::try_from(rowid)?))?;
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "mobileclip2",
+    any(feature = "modernbert", feature = "modernbert-quantized")
+))]
+fn add_image_tag_embeddings(
+    embedder: &Embedder,
+    image: CachedEmbeddings,
+    tags: &crate::image_tags::ImageTags,
+) -> Result<CachedEmbeddings> {
+    let Some(search_text) = tags.search_text.as_deref() else {
+        return Ok(image);
+    };
+    let lens = search_text.chars().count().to_string();
+    let text = compute_cached_embeddings(embedder, search_text, &lens)?;
+    let dim = dim_from_model_id(&image.model);
+    anyhow::ensure!(
+        dim_from_model_id(&text.model) == dim,
+        "image and tag embedding dimensions do not match"
+    );
+    let image_tensor =
+        Tensor::embeddings_from_packed(&image.embeddings, dim, &Device::Cpu)?;
+    let text_tensor = Tensor::embeddings_from_packed(&text.embeddings, dim, &Device::Cpu)?;
+    let embeddings = Tensor::cat(&[image_tensor, text_tensor], 0)?;
+    let embedding_count = image.embedding_count + text.embedding_count;
+    Ok(CachedEmbeddings {
+        model: image.model,
+        counts: embedding_count.to_string(),
+        embedding_count,
+        embeddings: embeddings.embeddings_to_packed()?,
+    })
+}
+
+#[cfg(all(
+    feature = "mobileclip2",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
+fn add_image_tag_embeddings(
+    _embedder: &Embedder,
+    image: CachedEmbeddings,
+    _tags: &crate::image_tags::ImageTags,
+) -> Result<CachedEmbeddings> {
+    Ok(image)
+}
+
 /// Cache a document's image vectors under its existing content hash so the
 /// regular indexing and search pipelines treat them like text token vectors.
 #[cfg(feature = "mobileclip2")]
@@ -1266,8 +1348,10 @@ pub fn cache_image_embeddings(
     rowid: u64,
     path: &std::path::Path,
 ) -> Result<usize> {
+    let tags = image_tags_for_path(path, embedder.assets_path());
     let embeddings = crate::compute_cached_image_embeddings(embedder, path)?;
-    ensure_image_document(db, rowid, path)?;
+    let embeddings = add_image_tag_embeddings(embedder, embeddings, &tags)?;
+    ensure_image_document(db, rowid, path, &tags)?;
     let hash = document_hash_for_rowid(db, rowid)?
         .ok_or_else(|| anyhow::anyhow!("failed to register image document rowid {rowid}"))?;
     let count = embeddings.embedding_count;
@@ -1283,8 +1367,10 @@ pub fn cache_image_embeddings_auto(
     embedder: &Embedder,
     path: &std::path::Path,
 ) -> Result<(u64, usize)> {
+    let tags = image_tags_for_path(path, embedder.assets_path());
     let embeddings = crate::compute_cached_image_embeddings(embedder, path)?;
-    cache_image_embeddings_auto_from_output(db, path, embeddings)
+    let embeddings = add_image_tag_embeddings(embedder, embeddings, &tags)?;
+    cache_image_embeddings_auto_from_output(db, path, embeddings, &tags)
 }
 
 /// Encode and cache several images using batched vision-model forward passes.
@@ -1305,19 +1391,25 @@ where
     // conservative size on Apple Silicon while still amortizing model launch.
     const IMAGE_EMBED_BATCH_SIZE: usize = 8;
     let mut pending_paths = Vec::with_capacity(paths.len());
+    let mut results = Vec::with_capacity(paths.len());
     for path in paths {
         if !force {
             if let Some(rowid) = cached_image_rowid(db, path)? {
-                log::info!(
-                    "skipping already embedded image rowid {rowid}: {}",
-                    path.display()
-                );
+                if image_document_has_tags(db, rowid)? {
+                    log::info!(
+                        "skipping already embedded and tagged image rowid {rowid}: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                let count = enrich_existing_image_tags(db, embedder, rowid, path)?;
+                on_embedded(path, rowid, count);
+                results.push((rowid, count));
                 continue;
             }
         }
         pending_paths.push(path.clone());
     }
-    let mut results = Vec::with_capacity(paths.len());
     for batch_paths in pending_paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
         let mut valid_paths = Vec::with_capacity(batch_paths.len());
         let mut images = Vec::with_capacity(batch_paths.len());
@@ -1339,11 +1431,14 @@ where
         let outputs = embedder.embed_image_tensor(&batch)?;
         for (index, path) in valid_paths.into_iter().enumerate() {
             let output = outputs.narrow(0, index, 1)?;
+            let tags = image_tags_for_path(path, embedder.assets_path());
             let embeddings = crate::cached_image_embeddings_from_output(output)?;
+            let embeddings = add_image_tag_embeddings(embedder, embeddings, &tags)?;
             let result = cache_image_embeddings_auto_from_output(
                 db,
                 path,
                 embeddings,
+                &tags,
             )?;
             on_embedded(path, result.0, result.1);
             results.push(result);
@@ -1370,10 +1465,43 @@ fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
 }
 
 #[cfg(feature = "mobileclip2")]
+fn image_document_has_tags(db: &DB, rowid: u64) -> Result<bool> {
+    let version = db
+        .query("SELECT json_extract(metadata, '$.image.version') FROM document WHERE rowid = ?1")?
+        .query_row((i64::try_from(rowid)?,), |row| row.get::<_, Option<i64>>(0))
+        .optional()?
+        .flatten()
+        .unwrap_or(0);
+    Ok(version >= 1)
+}
+
+#[cfg(feature = "mobileclip2")]
+fn enrich_existing_image_tags(
+    db: &DB,
+    embedder: &Embedder,
+    rowid: u64,
+    path: &std::path::Path,
+) -> Result<usize> {
+    let tags = image_tags_for_path(path, embedder.assets_path());
+    let hash = document_hash_for_rowid(db, rowid)?
+        .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cache hash"))?;
+    let cache = SqliteEmbeddingCache::new(db);
+    let image = cache
+        .get(&hash)?
+        .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cached embeddings"))?;
+    let embeddings = add_image_tag_embeddings(embedder, image, &tags)?;
+    let count = embeddings.embedding_count;
+    cache.put(&hash, &embeddings)?;
+    update_image_metadata(db, rowid, path, &tags)?;
+    Ok(count)
+}
+
+#[cfg(feature = "mobileclip2")]
 fn cache_image_embeddings_auto_from_output(
     db: &mut DB,
     path: &std::path::Path,
     embeddings: CachedEmbeddings,
+    tags: &crate::image_tags::ImageTags,
 ) -> Result<(u64, usize)> {
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let body = canonical_path.to_string_lossy();
@@ -1383,6 +1511,7 @@ fn cache_image_embeddings_auto_from_output(
         .optional()?;
     if let Some(rowid) = existing_rowid {
         let rowid: u64 = rowid.try_into()?;
+        update_image_metadata(db, rowid, path, tags)?;
         let hash = document_hash_for_rowid(db, rowid)?
             .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cache hash"))?;
         let count = embeddings.embedding_count;
@@ -1394,7 +1523,7 @@ fn cache_image_embeddings_auto_from_output(
         &uuid::Uuid::NAMESPACE_OID,
         format!("image:{}", canonical_path.display()).as_bytes(),
     );
-    let metadata = serde_json::json!({ "key": body.as_ref() }).to_string();
+    let metadata = image_metadata(body.as_ref(), tags);
     db.add_doc(None, &uuid, None, &metadata, &body, None)?;
 
     let rowid: u64 = db
@@ -1409,13 +1538,19 @@ fn cache_image_embeddings_auto_from_output(
 }
 
 #[cfg(feature = "mobileclip2")]
-fn ensure_image_document(db: &DB, rowid: u64, path: &std::path::Path) -> Result<()> {
+fn ensure_image_document(
+    db: &DB,
+    rowid: u64,
+    path: &std::path::Path,
+    tags: &crate::image_tags::ImageTags,
+) -> Result<()> {
     let rowid = i64::try_from(rowid)?;
     let mut query = db.query("SELECT length(body) FROM document WHERE rowid = ?1")?;
     let body_len = query
         .query_row((rowid,), |row| row.get::<_, Option<i64>>(0))
         .optional()?;
     if body_len.flatten().unwrap_or(0) > 0 {
+        update_image_metadata(db, rowid as u64, path, tags)?;
         return Ok(());
     }
     drop(query);
@@ -1433,7 +1568,7 @@ fn ensure_image_document(db: &DB, rowid: u64, path: &std::path::Path) -> Result<
         &uuid::Uuid::NAMESPACE_OID,
         format!("image:{rowid}:{}", path.display()).as_bytes(),
     );
-    let metadata = serde_json::json!({ "key": body.as_ref() }).to_string();
+    let metadata = image_metadata(body.as_ref(), tags);
     let date = iso8601_timestamp::Timestamp::now_utc().to_string();
     db.query(
         "INSERT INTO document(rowid, uuid, date, metadata, hash, body, lens)

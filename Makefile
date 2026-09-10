@@ -165,6 +165,9 @@ mobileclip2-assets: env/bin/transformers | assets
 mobileclip2-xtr-assets: modernbert-assets mobileclip2-assets
 	@test -f assets/mobileclip2-xtr.safetensors || (echo "missing assets/mobileclip2-xtr.safetensors; run scripts/export_mobileclip2_xtr.py <checkpoint> assets/mobileclip2-xtr.safetensors" >&2; exit 1)
 
+geotag-assets: env/pyvenv.cfg | assets
+	$(PYTHON_BIN) scripts/download_geotag_assets.py
+
 ifeq ($(ENCODER),modernbert)
 DOWNLOAD_TARGETS := modernbert-assets
 else ifeq ($(ENCODER),modernbert-quantized)
@@ -375,6 +378,7 @@ distclean:
 	macintel \
 	mobileclip2-assets \
 	mobileclip2-bench \
+	geotag-assets \
 	modernbert-assets \
 	modernbert-quantized-assets \
 	module \

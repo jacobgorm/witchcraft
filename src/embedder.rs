@@ -74,6 +74,7 @@ pub struct Embedder {
     tokenizer: Tokenizer,
     query_tokenizer: Tokenizer,
     model: t5_encoder::T5EncoderModel,
+    assets: std::path::PathBuf,
     #[cfg(all(
         feature = "mobileclip2",
         any(feature = "modernbert", feature = "modernbert-quantized")
@@ -102,12 +103,17 @@ impl Embedder {
             tokenizer,
             query_tokenizer,
             model,
+            assets: assets.to_path_buf(),
             #[cfg(all(
                 feature = "mobileclip2",
                 any(feature = "modernbert", feature = "modernbert-quantized")
             ))]
             image_model,
         })
+    }
+
+    pub fn assets_path(&self) -> &std::path::Path {
+        &self.assets
     }
 
     pub fn embed(&self, text: &str) -> Result<(Tensor, Vec<(usize, usize)>)> {

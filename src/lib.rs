@@ -48,6 +48,8 @@ use quantized_modernbert as t5_encoder;
 #[cfg(feature = "mobileclip2")]
 pub mod mobileclip2;
 #[cfg(feature = "mobileclip2")]
+pub mod image_tags;
+#[cfg(feature = "mobileclip2")]
 mod profiled_fastvit;
 #[cfg(all(
     feature = "mobileclip2",
@@ -3207,7 +3209,7 @@ pub fn compute_cached_embeddings(
 ///
 /// Combined MobileCLIP2/ModernBERT builds produce normalized 96d patch vectors,
 /// ready for the regular XTR indexing pipeline. The current residual adapter
-/// retains all 256 image tokens.
+/// retains all configured image tokens.
 #[cfg(feature = "mobileclip2")]
 pub fn compute_cached_image_embeddings<P: AsRef<Path>>(
     embedder: &Embedder,

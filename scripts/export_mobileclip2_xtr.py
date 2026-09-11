@@ -75,6 +75,11 @@ def main() -> None:
     checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     state = checkpoint_state["adapter"]
     shapes = {key: tuple(value.shape) for key, value in state.items()}
+    has_output_scale = shapes.pop("output_scale", None)
+    if has_output_scale is not None and has_output_scale != (96,):
+        raise ValueError(
+            f"expected output_scale shape (96,), got {has_output_scale}"
+        )
     has_output_bias = shapes.pop("output_bias", None)
     if has_output_bias is not None and has_output_bias != (96,):
         raise ValueError(
@@ -127,6 +132,8 @@ def main() -> None:
     }
     if has_output_bias is not None:
         metadata["output_bias"] = "true"
+    if has_output_scale is not None:
+        metadata["output_scale"] = "true"
     if residual_scale is not None:
         metadata["residual_scale"] = str(residual_scale)
     save_file(
@@ -134,10 +141,15 @@ def main() -> None:
         output,
         metadata=metadata,
     )
-    bias_description = ", output bias" if has_output_bias is not None else ""
+    affine_tensors = []
+    if has_output_scale is not None:
+        affine_tensors.append("output scale")
+    if has_output_bias is not None:
+        affine_tensors.append("output bias")
+    affine_description = f", {', '.join(affine_tensors)}" if affine_tensors else ""
     print(
         f"wrote {output} "
-        f"({adapter_type}, {image_tokens} tokens{bias_description})"
+        f"({adapter_type}, {image_tokens} tokens{affine_description})"
     )
 
     vision_state = checkpoint_state.get("image_visual")

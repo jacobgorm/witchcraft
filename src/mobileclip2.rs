@@ -234,6 +234,7 @@ enum XtrImageAdapter {
         token_gate_norm: LayerNorm,
         token_gate: Linear,
         keep_tokens: usize,
+        output_scale: Option<Tensor>,
         output_bias: Option<Tensor>,
     },
 }
@@ -250,6 +251,7 @@ impl XtrImageAdapter {
         adapter_type: &str,
         residual_scale: Option<f64>,
         image_tokens: Option<usize>,
+        has_output_scale: bool,
         has_output_bias: bool,
     ) -> Result<Self> {
         match adapter_type {
@@ -277,6 +279,11 @@ impl XtrImageAdapter {
                 keep_tokens: image_tokens.ok_or_else(|| {
                     Error::other("gated MobileCLIP2 XTR asset lacks image_tokens metadata")
                 })?,
+                output_scale: if has_output_scale {
+                    Some(vb.get(96, "output_scale")?)
+                } else {
+                    None
+                },
                 output_bias: if has_output_bias {
                     Some(vb.get(96, "output_bias")?)
                 } else {
@@ -321,6 +328,7 @@ impl XtrImageAdapter {
                 token_gate_norm,
                 token_gate,
                 keep_tokens,
+                output_scale,
                 output_bias,
             } => {
                 let xs = select_gated_tokens(
@@ -330,7 +338,10 @@ impl XtrImageAdapter {
                     *keep_tokens,
                 )?;
                 let base = normalize_xtr_vectors(&base.forward(&xs)?)?;
-                let output = base.broadcast_add(&(residual.forward(&xs)? * *scale)?)?;
+                let mut output = base.broadcast_add(&(residual.forward(&xs)? * *scale)?)?;
+                if let Some(scale) = output_scale {
+                    output = output.broadcast_mul(scale)?;
+                }
                 match output_bias {
                     Some(bias) => output.broadcast_add(bias),
                     None => Ok(output),
@@ -412,6 +423,7 @@ impl XtrImageEncoder {
             .map(|value| value.parse::<usize>())
             .transpose()
             .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
+        let has_output_scale = tensors.names().contains(&"output_scale");
         let has_output_bias = tensors.names().contains(&"output_bias");
         let adapter_vb = VarBuilder::from_buffered_safetensors(
             adapter_bytes.to_vec(),
@@ -423,6 +435,7 @@ impl XtrImageEncoder {
             adapter_type,
             residual_scale,
             image_tokens,
+            has_output_scale,
             has_output_bias,
         )?;
         Ok(Self {

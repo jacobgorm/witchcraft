@@ -853,12 +853,15 @@ fn main() -> Result<()> {
         for (score, _metadata, bodies, sub_idx, _date) in results {
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let body = &bodies[idx];
+            let path = PathBuf::from(body);
+            let is_image = is_supported_image_path(&path);
+            if is_image && score < IMAGE_DISPLAY_SCORE_THRESHOLD {
+                continue;
+            }
             println!("{score}: {body} @ {sub_idx}");
             println!("=============================================");
-            let path = PathBuf::from(body);
             if image_paths.len() < 9
-                && score >= IMAGE_DISPLAY_SCORE_THRESHOLD
-                && is_supported_image_path(&path)
+                && is_image
                 && !image_paths.contains(&path)
             {
                 image_paths.push(path);

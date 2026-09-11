@@ -504,6 +504,8 @@ fn is_supported_image_path(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+const IMAGE_DISPLAY_SCORE_THRESHOLD: f32 = 0.66;
+
 #[cfg(unix)]
 fn terminal_dimensions() -> Option<(u16, u16)> {
     let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
@@ -855,6 +857,7 @@ fn main() -> Result<()> {
             println!("=============================================");
             let path = PathBuf::from(body);
             if image_paths.len() < 9
+                && score >= IMAGE_DISPLAY_SCORE_THRESHOLD
                 && is_supported_image_path(&path)
                 && !image_paths.contains(&path)
             {

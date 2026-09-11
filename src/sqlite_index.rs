@@ -5,7 +5,7 @@ use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
     clear_generations_cache, compute_cached_embeddings_many, dim_from_model_id,
     docptrs_for_counts, document_cache_hash, embed_query_for_search,
-    embedding_count_segment_count, hybrid_reciprocal_rank_fusion,
+    embedding_counts_match_chunk_count, hybrid_reciprocal_rank_fusion,
     index_buffered_embeddings_with_options, load_cached_embeddings,
     load_or_compute_cached_embeddings, match_centroids_raw, model_id_for_dim,
     query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr, Embedder,
@@ -1164,7 +1164,7 @@ pub fn embed_chunks_with_cache(
 
             if let Some(embeddings) = load_cached_embeddings(cache, rowid.try_into()?, &hash)? {
                 let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
-                if embedding_count_segment_count(&embeddings.counts) == chunk_count {
+                if embedding_counts_match_chunk_count(&embeddings.counts, chunk_count) {
                     progress.inc(1);
                     continue;
                 }

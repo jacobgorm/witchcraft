@@ -3031,17 +3031,23 @@ pub(crate) fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
     document_indices
 }
 
-pub(crate) fn embedding_count_segment_count(counts: &str) -> usize {
-    counts
-        .split(',')
-        .filter(|count| {
-            count
-                .strip_prefix('i')
-                .unwrap_or(count)
-                .parse::<u32>()
-                .is_ok()
-        })
+pub(crate) fn embedding_counts_match_chunk_count(counts: &str, chunk_count: usize) -> bool {
+    let mut segments = counts.split(',');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+
+    if let Some(image_count) = first.strip_prefix('i') {
+        return chunk_count == 1
+            && image_count.parse::<u32>().is_ok()
+            && segments.all(|count| count.parse::<u32>().is_ok());
+    }
+
+    std::iter::once(first)
+        .chain(segments)
+        .filter(|count| count.parse::<u32>().is_ok())
         .count()
+        == chunk_count
 }
 
 fn cached_embeddings_for_rowid(
@@ -3376,12 +3382,12 @@ pub(crate) fn load_or_compute_cached_embeddings(
 ) -> Result<(CachedEmbeddings, bool)> {
     if let Some(embeddings) = load_cached_embeddings(cache, rowid, hash)? {
         let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
-        let count_count = embedding_count_segment_count(&embeddings.counts);
-        if count_count == chunk_count {
+        if embedding_counts_match_chunk_count(&embeddings.counts, chunk_count) {
             return Ok((embeddings, false));
         }
         warn!(
-            "cached embeddings for document {rowid} have {count_count} chunk counts, expected {chunk_count}; recomputing"
+            "cached embeddings for document {rowid} have counts {:?}, incompatible with {chunk_count} document chunks; recomputing",
+            embeddings.counts
         );
     }
 
@@ -4336,7 +4342,9 @@ fn image_count_segments_tag_only_image_vector_keys() {
     assert!(ptrs[2..]
         .iter()
         .all(|&(_, sub_idx)| sub_idx & IMAGE_VECTOR_SUB_IDX_FLAG == 0));
-    assert_eq!(embedding_count_segment_count("i2,3"), 2);
+    assert!(embedding_counts_match_chunk_count("i2,3", 1));
+    assert!(!embedding_counts_match_chunk_count("i2,3", 2));
+    assert!(embedding_counts_match_chunk_count("2,3", 2));
 }
 
 #[test]

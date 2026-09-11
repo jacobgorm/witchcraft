@@ -4,7 +4,8 @@ use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
     clear_generations_cache, compute_cached_embeddings_many, dim_from_model_id,
-    document_cache_hash, embed_query_for_search, hybrid_reciprocal_rank_fusion,
+    docptrs_for_counts, document_cache_hash, embed_query_for_search,
+    embedding_count_segment_count, hybrid_reciprocal_rank_fusion,
     index_buffered_embeddings_with_options, load_cached_embeddings,
     load_or_compute_cached_embeddings, match_centroids_raw, model_id_for_dim,
     query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr, Embedder,
@@ -142,20 +143,6 @@ pub fn match_centroids_with_query_weights(
     )
 }
 
-fn docptrs_for_cached_counts(rowid: u32, counts: &str) -> Vec<DocPtr> {
-    let mut ptrs = Vec::new();
-    for (sub_idx, count) in counts
-        .split(',')
-        .filter_map(|count| count.parse::<u32>().ok())
-        .enumerate()
-    {
-        for _ in 0..count {
-            ptrs.push((rowid, sub_idx as u32));
-        }
-    }
-    ptrs
-}
-
 fn flush_exact_batch(
     query_embeddings: &[Tensor],
     ptrs: &mut Vec<DocPtr>,
@@ -236,7 +223,7 @@ pub fn exact_match_centroids_bulk(
         let Some(cached) = cache.get_for_document(rowid_u64, hash.as_deref().unwrap_or(""))? else {
             continue;
         };
-        let docptrs = docptrs_for_cached_counts(rowid_u32, &cached.counts);
+        let docptrs = docptrs_for_counts(rowid_u32, &cached.counts);
         anyhow::ensure!(
             docptrs.len() == cached.embedding_count,
             "rowid {rowid} has {} docptrs but {} embeddings",
@@ -694,7 +681,7 @@ fn append_unindexed_embedding(
         &Device::Cpu,
     )?;
     let rowid: u32 = record.rowid.try_into()?;
-    let ptrs = docptrs_for_cached_counts(rowid, &cached.counts);
+    let ptrs = docptrs_for_counts(rowid, &cached.counts);
     anyhow::ensure!(
         ptrs.len() == cached.embedding_count,
         "rowid {} has {} embedding rows but {} document indices",
@@ -1177,7 +1164,7 @@ pub fn embed_chunks_with_cache(
 
             if let Some(embeddings) = load_cached_embeddings(cache, rowid.try_into()?, &hash)? {
                 let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
-                if embeddings.counts.split(',').filter_map(|s| s.parse::<u32>().ok()).count() == chunk_count {
+                if embedding_count_segment_count(&embeddings.counts) == chunk_count {
                     progress.inc(1);
                     continue;
                 }
@@ -1321,7 +1308,7 @@ fn add_image_tag_embeddings(
     let embedding_count = image.embedding_count + text.embedding_count;
     Ok(CachedEmbeddings {
         model: image.model,
-        counts: embedding_count.to_string(),
+        counts: format!("{},{}", image.counts, text.counts),
         embedding_count,
         embeddings: embeddings.embeddings_to_packed()?,
     })

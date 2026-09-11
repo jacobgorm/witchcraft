@@ -295,7 +295,13 @@ impl DB {
         for (hash, counts) in rows {
             let embedding_count: usize = counts
                 .split(',')
-                .filter_map(|count| count.parse::<usize>().ok())
+                .filter_map(|count| {
+                    count
+                        .strip_prefix('i')
+                        .unwrap_or(count)
+                        .parse::<usize>()
+                        .ok()
+                })
                 .sum();
             update.execute((embedding_count as i64, hash))?;
         }

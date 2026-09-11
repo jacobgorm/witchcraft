@@ -289,6 +289,35 @@ mod tests {
     }
 
     #[test]
+    fn test_image_vector_score_boost_is_applied_before_argmax() -> anyhow::Result<()> {
+        let query = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &Device::Cpu)?;
+        let embeddings = Tensor::from_vec(
+            vec![
+                0.50f32, 0.0, // text vector
+                0.35, 0.0,    // image vector wins only after the +0.21 boost
+            ],
+            (2, 2),
+            &Device::Cpu,
+        )?;
+        let image_ptr = crate::docptrs_for_counts(2, "i1")[0];
+        let unindexed = vec![(vec![(1, 0), image_ptr], embeddings)];
+
+        let results = crate::match_centroids_raw(
+            &[],
+            &query,
+            None,
+            &unindexed,
+            f32::NEG_INFINITY,
+            10,
+        )?;
+
+        assert_eq!((results[0].1, results[0].2), (2, 0));
+        assert!((results[0].0 - 0.56).abs() < 1e-6);
+        assert!((results[1].0 - 0.50).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
     fn test_incremental_index() -> std::io::Result<()> {
         let dir = tempdir().unwrap();
         let path: PathBuf = dir.path().join("warp");

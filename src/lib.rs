@@ -216,6 +216,11 @@ fn weighted_center_indices<R: RngExt + ?Sized>(
 /// Allows precise location of results within subdivided documents
 pub type DocPtr = (u32, u32);
 
+// Persist image modality in the otherwise-unused high bit of the indexed
+// sub-chunk key. Public search results always have the bit removed.
+const IMAGE_VECTOR_SUB_IDX_FLAG: u32 = 1 << 31;
+const IMAGE_VECTOR_SCORE_BOOST: f32 = 0.21;
+
 #[derive(Clone, Copy, Debug)]
 pub struct IndexOptions {
     residual_quant_bits: u8,
@@ -2503,6 +2508,14 @@ fn vmax_inplace(current: &mut [f32], row: &[f32]) {
     }
 }
 
+#[inline(always)]
+fn vmax_with_offset_inplace(current: &mut [f32], row: &[f32], offset: f32) {
+    debug_assert_eq!(current.len(), row.len());
+    for (current, &value) in current.iter_mut().zip(row) {
+        *current = current.max(value + offset);
+    }
+}
+
 /// Load generation centroid data from sidecar files (cached).
 pub fn load_generations(paths: &[PathBuf], device: &Device) -> Result<Arc<Vec<GenerationCentroids>>> {
     let key = paths.to_vec();
@@ -2905,7 +2918,9 @@ pub fn match_centroids_raw(
         &sim[start..start + n]
     };
 
-    all.sort_unstable();
+    all.sort_unstable_by_key(|&((rowid, sub_idx), _)| {
+        (rowid, sub_idx & !IMAGE_VECTOR_SUB_IDX_FLAG)
+    });
 
     let mut sub_scores = vec![0.0f32; n];
     sub_scores.copy_from_slice(&missing_similarities);
@@ -2921,11 +2936,13 @@ pub fn match_centroids_raw(
     for i in 0.. {
 
         let is_beyond_end = i == all.len();
-        let ((idx, sub_idx), pos) = if is_beyond_end {
+        let ((idx, encoded_sub_idx), pos) = if is_beyond_end {
             ((u32::MAX, u32::MAX), 0)
         } else {
             all[i]
         };
+        let is_image_vector = encoded_sub_idx & IMAGE_VECTOR_SUB_IDX_FLAG != 0;
+        let sub_idx = encoded_sub_idx & !IMAGE_VECTOR_SUB_IDX_FLAG;
 
         if i > 0 {
             let idx_change = prev_idx != idx;
@@ -2956,7 +2973,11 @@ pub fn match_centroids_raw(
         }
 
         let row = row_at(pos);
-        vmax_inplace(&mut sub_scores, row);
+        if is_image_vector {
+            vmax_with_offset_inplace(&mut sub_scores, row, IMAGE_VECTOR_SCORE_BOOST);
+        } else {
+            vmax_inplace(&mut sub_scores, row);
+        }
 
         assert!(i == 0 || prev_idx <= idx);
         assert!(i == 0 || (prev_idx != idx || prev_sub_idx <= sub_idx));
@@ -2989,18 +3010,38 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
-fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
+pub(crate) fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
     let mut document_indices = Vec::new();
-    for (i, count) in counts
-        .split(',')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .enumerate()
-    {
+    for (i, encoded_count) in counts.split(',').enumerate() {
+        let (is_image, count) = match encoded_count.strip_prefix('i') {
+            Some(count) => (true, count),
+            None => (false, encoded_count),
+        };
+        let Ok(count) = count.parse::<u32>() else {
+            continue;
+        };
+        let mut sub_idx = i as u32;
+        if is_image {
+            sub_idx |= IMAGE_VECTOR_SUB_IDX_FLAG;
+        }
         for _ in 0..count {
-            document_indices.push((id, i as u32));
+            document_indices.push((id, sub_idx));
         }
     }
     document_indices
+}
+
+pub(crate) fn embedding_count_segment_count(counts: &str) -> usize {
+    counts
+        .split(',')
+        .filter(|count| {
+            count
+                .strip_prefix('i')
+                .unwrap_or(count)
+                .parse::<u32>()
+                .is_ok()
+        })
+        .count()
 }
 
 fn cached_embeddings_for_rowid(
@@ -3227,7 +3268,7 @@ pub fn cached_image_embeddings_from_output(output: Tensor) -> Result<CachedEmbed
     let (rows, cols) = embeddings.dims2()?;
     Ok(CachedEmbeddings {
         model: model_id_for_dim(cols),
-        counts: rows.to_string(),
+        counts: format!("i{rows}"),
         embedding_count: rows,
         embeddings: embeddings.embeddings_to_packed()?,
     })
@@ -3335,7 +3376,7 @@ pub(crate) fn load_or_compute_cached_embeddings(
 ) -> Result<(CachedEmbeddings, bool)> {
     if let Some(embeddings) = load_cached_embeddings(cache, rowid, hash)? {
         let chunk_count = lens.split(',').filter_map(|s| s.parse::<usize>().ok()).count();
-        let count_count = embeddings.counts.split(',').filter_map(|s| s.parse::<u32>().ok()).count();
+        let count_count = embedding_count_segment_count(&embeddings.counts);
         if count_count == chunk_count {
             return Ok((embeddings, false));
         }
@@ -4281,8 +4322,21 @@ fn image_embeddings_use_one_xtr_document() {
     let output = Tensor::zeros((1, 256, 96), DType::F32, &Device::Cpu).unwrap();
     let cached = cached_image_embeddings_from_output(output).unwrap();
     assert_eq!(dim_from_model_id(&cached.model), 96);
-    assert_eq!(cached.counts, "256");
+    assert_eq!(cached.counts, "i256");
     assert_eq!(cached.embedding_count, 256);
+}
+
+#[test]
+fn image_count_segments_tag_only_image_vector_keys() {
+    let ptrs = docptrs_for_counts(7, "i2,3");
+    assert_eq!(ptrs.len(), 5);
+    assert!(ptrs[..2]
+        .iter()
+        .all(|&(_, sub_idx)| sub_idx & IMAGE_VECTOR_SUB_IDX_FLAG != 0));
+    assert!(ptrs[2..]
+        .iter()
+        .all(|&(_, sub_idx)| sub_idx & IMAGE_VECTOR_SUB_IDX_FLAG == 0));
+    assert_eq!(embedding_count_segment_count("i2,3"), 2);
 }
 
 #[test]
@@ -4292,6 +4346,7 @@ fn test_compress_decompress_keys_roundtrip() {
         vec![(1, 1)],
         vec![(1, 1), (1, 3), (2, 0), (2, 1)],
         vec![(10, 0), (10, 1), (10, 2), (11, 0)],
+        vec![(10, 1), (10, IMAGE_VECTOR_SUB_IDX_FLAG), (11, 0)],
         vec![(1, 2), (1, 2), (1, 2), (2, 2)],
         vec![(0, 0)],
         vec![],

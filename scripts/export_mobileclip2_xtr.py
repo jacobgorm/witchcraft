@@ -75,6 +75,11 @@ def main() -> None:
     checkpoint_state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     state = checkpoint_state["adapter"]
     shapes = {key: tuple(value.shape) for key, value in state.items()}
+    has_output_bias = shapes.pop("output_bias", None)
+    if has_output_bias is not None and has_output_bias != (96,):
+        raise ValueError(
+            f"expected output_bias shape (96,), got {has_output_bias}"
+        )
     config = {}
     config_path = checkpoint.parent / "config.json"
     if config_path.is_file():
@@ -120,6 +125,8 @@ def main() -> None:
         "image_size": "512",
         "image_tokens": str(image_tokens),
     }
+    if has_output_bias is not None:
+        metadata["output_bias"] = "true"
     if residual_scale is not None:
         metadata["residual_scale"] = str(residual_scale)
     save_file(
@@ -127,7 +134,11 @@ def main() -> None:
         output,
         metadata=metadata,
     )
-    print(f"wrote {output} ({adapter_type}, {image_tokens} tokens)")
+    bias_description = ", output bias" if has_output_bias is not None else ""
+    print(
+        f"wrote {output} "
+        f"({adapter_type}, {image_tokens} tokens{bias_description})"
+    )
 
     vision_state = checkpoint_state.get("image_visual")
     if vision_state is not None:

@@ -234,6 +234,7 @@ enum XtrImageAdapter {
         token_gate_norm: LayerNorm,
         token_gate: Linear,
         keep_tokens: usize,
+        output_bias: Option<Tensor>,
     },
 }
 
@@ -249,6 +250,7 @@ impl XtrImageAdapter {
         adapter_type: &str,
         residual_scale: Option<f64>,
         image_tokens: Option<usize>,
+        has_output_bias: bool,
     ) -> Result<Self> {
         match adapter_type {
             "gated_mlp" => Ok(Self::Gated {
@@ -275,6 +277,11 @@ impl XtrImageAdapter {
                 keep_tokens: image_tokens.ok_or_else(|| {
                     Error::other("gated MobileCLIP2 XTR asset lacks image_tokens metadata")
                 })?,
+                output_bias: if has_output_bias {
+                    Some(vb.get(96, "output_bias")?)
+                } else {
+                    None
+                },
             }),
             other => Err(Error::other(format!(
                 "unsupported MobileCLIP2 XTR adapter type `{other}`"
@@ -314,6 +321,7 @@ impl XtrImageAdapter {
                 token_gate_norm,
                 token_gate,
                 keep_tokens,
+                output_bias,
             } => {
                 let xs = select_gated_tokens(
                     xs,
@@ -322,7 +330,11 @@ impl XtrImageAdapter {
                     *keep_tokens,
                 )?;
                 let base = normalize_xtr_vectors(&base.forward(&xs)?)?;
-                base.broadcast_add(&(residual.forward(&xs)? * *scale)?)
+                let output = base.broadcast_add(&(residual.forward(&xs)? * *scale)?)?;
+                match output_bias {
+                    Some(bias) => output.broadcast_add(bias),
+                    None => Ok(output),
+                }
             }
         }
     }
@@ -400,6 +412,7 @@ impl XtrImageEncoder {
             .map(|value| value.parse::<usize>())
             .transpose()
             .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
+        let has_output_bias = tensors.names().contains(&"output_bias");
         let adapter_vb = VarBuilder::from_buffered_safetensors(
             adapter_bytes.to_vec(),
             DType::F32,
@@ -410,6 +423,7 @@ impl XtrImageEncoder {
             adapter_type,
             residual_scale,
             image_tokens,
+            has_output_bias,
         )?;
         Ok(Self {
             vision_model,

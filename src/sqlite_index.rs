@@ -7,9 +7,10 @@ use crate::{
     docptrs_for_counts, document_cache_hash, embed_query_for_search,
     embedding_counts_match_chunk_count, hybrid_reciprocal_rank_fusion,
     index_buffered_embeddings_with_options, load_cached_embeddings,
-    load_or_compute_cached_embeddings, match_centroids_raw, model_id_for_dim,
-    query_token_salience_enabled, split_by_codepoints, CachedEmbeddings, DocPtr, Embedder,
-    EmbeddingCache, EmbeddingsCache, IndexOptions, QueryEmbeddings, SqlStatementInternal, DB,
+    load_or_compute_cached_embeddings, match_centroids_raw,
+    match_centroids_raw_with_image_score_boost, model_id_for_dim, query_token_salience_enabled,
+    split_by_codepoints, CachedEmbeddings, DocPtr, Embedder, EmbeddingCache, EmbeddingsCache,
+    IndexOptions, QueryEmbeddings, SqlStatementInternal, DB,
 };
 #[cfg(all(
     feature = "mobileclip2",
@@ -140,6 +141,7 @@ pub fn match_centroids_with_query_weights(
         sql_filter,
         None,
         &cache,
+        None,
     )
 }
 
@@ -280,6 +282,7 @@ pub fn match_centroids_with_cache(
         sql_filter,
         Some(embedder),
         cache,
+        None,
     )
 }
 
@@ -292,6 +295,7 @@ pub(crate) fn match_centroids_from_cache(
     sql_filter: Option<&crate::SqlStatementInternal>,
     embedder: Option<&Embedder>,
     cache: &dyn EmbeddingCache,
+    image_score_boost: Option<f32>,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let index = index_for_db(db);
     let generation_files = index.generation_files()?;
@@ -309,14 +313,25 @@ pub(crate) fn match_centroids_from_cache(
         vec![]
     };
 
-    let scored_results = match_centroids_raw(
-        &generation_files,
-        query_embeddings,
-        query_weights,
-        &unindexed,
-        threshold,
-        top_k,
-    )?;
+    let scored_results = match image_score_boost {
+        Some(image_score_boost) => match_centroids_raw_with_image_score_boost(
+            &generation_files,
+            query_embeddings,
+            query_weights,
+            &unindexed,
+            threshold,
+            top_k,
+            image_score_boost,
+        )?,
+        None => match_centroids_raw(
+            &generation_files,
+            query_embeddings,
+            query_weights,
+            &unindexed,
+            threshold,
+            top_k,
+        )?,
+    };
 
     match sql_filter {
         Some(filter) => {
@@ -1750,7 +1765,9 @@ pub fn search_with_fulltext_prefix_wildcard(
 ///
 /// This is useful for non-text query modalities such as images. The query is
 /// not persisted, and `query_weights` may be omitted to give every query vector
-/// equal weight in the late-interaction score.
+/// equal weight in the late-interaction score. Set `boost_image_scores` to
+/// false when the query itself is an image and cross-modal calibration is not
+/// needed.
 pub fn search_embeddings(
     db: &DB,
     query_embeddings: &Tensor,
@@ -1758,16 +1775,32 @@ pub fn search_embeddings(
     threshold: f32,
     top_k: usize,
     sql_filter: Option<&SqlStatementInternal>,
+    boost_image_scores: bool,
 ) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
     let now = std::time::Instant::now();
-    let sem_matches = match_centroids_with_query_weights(
-        db,
-        query_embeddings,
-        query_weights,
-        threshold,
-        top_k,
-        sql_filter,
-    )?;
+    let sem_matches = if boost_image_scores {
+        match_centroids_with_query_weights(
+            db,
+            query_embeddings,
+            query_weights,
+            threshold,
+            top_k,
+            sql_filter,
+        )?
+    } else {
+        let cache = SqliteEmbeddingCache::new(db);
+        match_centroids_from_cache(
+            db,
+            query_embeddings,
+            query_weights,
+            threshold,
+            top_k,
+            sql_filter,
+            None,
+            &cache,
+            Some(0.0),
+        )?
+    };
     info!("semantic search found {} matches", sem_matches.len());
     let results = hydrate_search_results(db, &sem_matches, top_k)?;
     debug!(
@@ -1884,6 +1917,7 @@ fn search_inner(
                 sql_filter,
                 Some(embedder),
                 &embedding_cache,
+                None,
             )?
         } else {
             vec![]
@@ -2014,6 +2048,7 @@ fn search_rowids_inner(
                 sql_filter,
                 Some(embedder),
                 embedding_cache,
+                None,
             )?,
             (Some(embedding_cache), false) => match_centroids_from_cache(
                 db,
@@ -2024,6 +2059,7 @@ fn search_rowids_inner(
                 sql_filter,
                 None,
                 embedding_cache,
+                None,
             )?,
             (None, _) => match_centroids_with_query_weights(
                 db,

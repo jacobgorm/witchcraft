@@ -848,7 +848,8 @@ fn main() -> Result<()> {
             validate_semantic_search(&db, Some(&embedder))?;
             let query = embedder.embed_image_path(image_path)?.squeeze(0)?;
             witchcraft::reset_bucket_io_counters();
-            let results = witchcraft::search_embeddings(&db, &query, None, 0.0, 10, None)?;
+            let results =
+                witchcraft::search_embeddings(&db, &query, None, 0.0, 10, None, false)?;
             let mut image_paths = Vec::new();
             for (score, _metadata, bodies, sub_idx, _date) in results {
                 let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));

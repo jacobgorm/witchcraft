@@ -314,6 +314,19 @@ mod tests {
         assert_eq!((results[0].1, results[0].2), (2, 0));
         assert!((results[0].0 - 0.56).abs() < 1e-6);
         assert!((results[1].0 - 0.50).abs() < 1e-6);
+
+        let unboosted = crate::match_centroids_raw_with_image_score_boost(
+            &[],
+            &query,
+            None,
+            &unindexed,
+            f32::NEG_INFINITY,
+            10,
+            0.0,
+        )?;
+        assert_eq!((unboosted[0].1, unboosted[0].2), (1, 0));
+        assert!((unboosted[0].0 - 0.50).abs() < 1e-6);
+        assert!((unboosted[1].0 - 0.35).abs() < 1e-6);
         Ok(())
     }
 
@@ -1037,6 +1050,7 @@ mod tests {
             0.3,
             10,
             None,
+            true,
         )?;
         assert!(
             !results.is_empty(),

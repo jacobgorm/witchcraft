@@ -2659,6 +2659,26 @@ pub fn match_centroids_raw(
     threshold: f32,
     top_k: usize,
 ) -> Result<Vec<(f32, u32, u32)>> {
+    match_centroids_raw_with_image_score_boost(
+        generation_files,
+        query_embeddings,
+        query_weights,
+        unindexed,
+        threshold,
+        top_k,
+        IMAGE_VECTOR_SCORE_BOOST,
+    )
+}
+
+pub(crate) fn match_centroids_raw_with_image_score_boost(
+    generation_files: &[PathBuf],
+    query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
+    unindexed: &[(Vec<DocPtr>, Tensor)],
+    threshold: f32,
+    top_k: usize,
+    image_vector_score_boost: f32,
+) -> Result<Vec<(f32, u32, u32)>> {
     let device = query_embeddings.device();
     let generations = load_generations(generation_files, device)?;
     let total_start = std::time::Instant::now();
@@ -2975,7 +2995,7 @@ pub fn match_centroids_raw(
 
         let row = row_at(pos);
         if is_image_vector {
-            vmax_with_offset_inplace(&mut sub_scores, row, IMAGE_VECTOR_SCORE_BOOST);
+            vmax_with_offset_inplace(&mut sub_scores, row, image_vector_score_boost);
         } else {
             vmax_inplace(&mut sub_scores, row);
         }

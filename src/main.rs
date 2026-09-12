@@ -834,6 +834,36 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "mobileclip2"))]
         anyhow::bail!("image/text scoring requires building with --features mobileclip2");
+    } else if args.len() == 3 && args[1] == "queryimage" {
+        #[cfg(feature = "mobileclip2")]
+        {
+            let device = witchcraft::make_device();
+            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+            let db = DB::new_reader(db_name)?;
+            validate_semantic_search(&db, Some(&embedder))?;
+            let query = embedder.embed_image_path(&args[2])?.squeeze(0)?;
+            witchcraft::reset_bucket_io_counters();
+            let results = witchcraft::search_embeddings(&db, &query, None, 0.0, 10, None)?;
+            let mut image_paths = Vec::new();
+            for (score, _metadata, bodies, sub_idx, _date) in results {
+                let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+                let body = &bodies[idx];
+                let path = PathBuf::from(body);
+                let is_image = is_supported_image_path(&path);
+                if is_image && score < IMAGE_DISPLAY_SCORE_THRESHOLD {
+                    continue;
+                }
+                println!("{score}: {body} @ {sub_idx}");
+                println!("=============================================");
+                if image_paths.len() < 9 && is_image && !image_paths.contains(&path) {
+                    image_paths.push(path);
+                }
+            }
+            witchcraft::log_bucket_io_counters();
+            display_image_grid(&image_paths);
+        }
+        #[cfg(not(feature = "mobileclip2"))]
+        anyhow::bail!("image querying requires building with --features mobileclip2");
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
         let embedder = if args[1] != "fulltext" {
             let device = witchcraft::make_device();
@@ -907,7 +937,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | queryimage <path> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -1746,6 +1746,110 @@ pub fn search_with_fulltext_prefix_wildcard(
     )
 }
 
+/// Search the semantic index with embeddings that have already been computed.
+///
+/// This is useful for non-text query modalities such as images. The query is
+/// not persisted, and `query_weights` may be omitted to give every query vector
+/// equal weight in the late-interaction score.
+pub fn search_embeddings(
+    db: &DB,
+    query_embeddings: &Tensor,
+    query_weights: Option<&[f32]>,
+    threshold: f32,
+    top_k: usize,
+    sql_filter: Option<&SqlStatementInternal>,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    let now = std::time::Instant::now();
+    let sem_matches = match_centroids_with_query_weights(
+        db,
+        query_embeddings,
+        query_weights,
+        threshold,
+        top_k,
+        sql_filter,
+    )?;
+    info!("semantic search found {} matches", sem_matches.len());
+    let results = hydrate_search_results(db, &sem_matches, top_k)?;
+    debug!(
+        "witchcraft embedding search took {} ms end-to-end.",
+        now.elapsed().as_millis()
+    );
+    Ok(results)
+}
+
+fn hydrate_search_results(
+    db: &DB,
+    matches: &[(f32, u32, u32)],
+    top_k: usize,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    let mut scores: HashMap<DocPtr, f32> = HashMap::new();
+    for &(score, idx, sub_idx) in matches {
+        scores.insert((idx, sub_idx), score);
+    }
+    let mut fused: Vec<DocPtr> = matches
+        .iter()
+        .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+        .collect();
+    fused.truncate(top_k);
+
+    hydrate_ranked_results(db, &fused, &scores)
+}
+
+fn hydrate_ranked_results(
+    db: &DB,
+    fused: &[DocPtr],
+    scores: &HashMap<DocPtr, f32>,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    let mut results = vec![];
+    // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
+    // values that clamp to the same position, producing duplicates.
+    let mut seen: HashMap<u32, bool> = HashMap::new();
+    let mut body_query =
+        db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
+    for &(idx, sub_idx) in fused {
+        let tuple: DocPtr = (idx, sub_idx);
+        let score = match scores.get(&tuple) {
+            Some(score) => *score,
+            None => 0.0f32,
+        };
+        let row = body_query
+            .query_row((idx,), |row| {
+                let (metadata, body, lens, date) = (
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                );
+                let lens: Vec<usize> = lens
+                    .split(',')
+                    .map(|x| x.parse::<usize>().unwrap())
+                    .collect();
+                let bodies: Vec<String> = split_by_codepoints(&body, &lens)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                Ok((metadata, bodies, date))
+            })
+            .optional()?;
+        let Some((metadata, bodies, date)) = row else {
+            continue;
+        };
+
+        let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
+        if seen.insert(idx, true).is_some() {
+            continue;
+        }
+        results.push((score, metadata, bodies, sub, date));
+    }
+
+    let mut max = -1.0f32;
+    for (score, _, _, _, _) in results.iter_mut().rev() {
+        max = max.max(*score);
+        *score = max;
+    }
+    Ok(results)
+}
+
 fn search_inner(
     db: &DB,
     embedder: Option<&Embedder>,
@@ -1819,53 +1923,7 @@ fn search_inner(
     };
     fused.truncate(top_k);
 
-    let mut results = vec![];
-    // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
-    // values that clamp to the same position, producing duplicates.
-    let mut seen: HashMap<u32, bool> = HashMap::new();
-    let mut body_query =
-        db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
-    for (idx, sub_idx) in fused {
-        let tuple: DocPtr = (idx, sub_idx);
-        let score = match scores.get(&tuple) {
-            Some(score) => *score,
-            None => 0.0f32,
-        };
-        let row = body_query
-            .query_row((idx,), |row| {
-                let (metadata, body, lens, date) = (
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                );
-                let lens: Vec<usize> = lens
-                    .split(',')
-                    .map(|x| x.parse::<usize>().unwrap())
-                    .collect();
-                let bodies: Vec<String> = split_by_codepoints(&body, &lens)
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                Ok((metadata, bodies, date))
-            })
-            .optional()?;
-        let Some((metadata, bodies, date)) = row else {
-            continue;
-        };
-
-        let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
-        if seen.insert(idx, true).is_some() {
-            continue;
-        }
-        results.push((score, metadata, bodies, sub, date));
-    }
-
-    let mut max = -1.0f32;
-    for (score, _, _, _, _) in results.iter_mut().rev() {
-        max = max.max(*score);
-        *score = max;
-    }
+    let results = hydrate_ranked_results(db, &fused, &scores)?;
 
     debug!(
         "witchcraft search took {} ms end-to-end.",

@@ -1028,6 +1028,20 @@ mod tests {
             "honey preservation", 0.3, 10, false, None,
         )?;
         assert!(!results.is_empty(), "single-doc search must return the document");
+
+        let query = crate::embed_query_for_search(&embedder, "honey preservation")?;
+        let results = crate::search_embeddings(
+            &db,
+            &query.embeddings,
+            query.weights.as_deref(),
+            0.3,
+            10,
+            None,
+        )?;
+        assert!(
+            !results.is_empty(),
+            "precomputed-vector search must return the document"
+        );
         Ok(())
     }
       

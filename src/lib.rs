@@ -131,8 +131,9 @@ pub use sqlite_index::{
     exact_match_centroids_bulk, fulltext_search, fulltext_search_with_prefix_wildcard,
     index_chunks, index_chunks_with_cache, index_chunks_with_cache_and_options,
     index_chunks_with_options, match_centroids, match_centroids_with_cache,
-    match_centroids_with_query_weights, search, search_cached_rowids_with_cache, search_rowids,
-    search_with_fulltext_prefix_wildcard, semantic_index_unavailable_reason,
+    match_centroids_with_query_weights, search, search_cached_rowids_with_cache,
+    search_embeddings, search_rowids, search_with_fulltext_prefix_wildcard,
+    semantic_index_unavailable_reason,
 };
 #[cfg(all(feature = "sqlite", feature = "mobileclip2"))]
 pub use sqlite_index::{

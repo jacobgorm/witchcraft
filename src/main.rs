@@ -834,14 +834,19 @@ fn main() -> Result<()> {
         }
         #[cfg(not(feature = "mobileclip2"))]
         anyhow::bail!("image/text scoring requires building with --features mobileclip2");
-    } else if args.len() == 3 && args[1] == "queryimage" {
+    } else if args.len() >= 3
+        && args[1] == "queryimage"
+        && (args.len() == 3 || (args.len() == 4 && args[2] == "-d"))
+    {
         #[cfg(feature = "mobileclip2")]
         {
+            let display_images = args[2] == "-d";
+            let image_path = if display_images { &args[3] } else { &args[2] };
             let device = witchcraft::make_device();
             let embedder = witchcraft::Embedder::new(&device, &assets)?;
             let db = DB::new_reader(db_name)?;
             validate_semantic_search(&db, Some(&embedder))?;
-            let query = embedder.embed_image_path(&args[2])?.squeeze(0)?;
+            let query = embedder.embed_image_path(image_path)?.squeeze(0)?;
             witchcraft::reset_bucket_io_counters();
             let results = witchcraft::search_embeddings(&db, &query, None, 0.0, 10, None)?;
             let mut image_paths = Vec::new();
@@ -860,11 +865,16 @@ fn main() -> Result<()> {
                 }
             }
             witchcraft::log_bucket_io_counters();
-            display_image_grid(&image_paths);
+            if display_images {
+                display_image_grid(&image_paths);
+            }
         }
         #[cfg(not(feature = "mobileclip2"))]
         anyhow::bail!("image querying requires building with --features mobileclip2");
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid" || args[1] == "fulltext") {
+        let display_images = args[2] == "-d";
+        let query_args = if display_images { &args[3..] } else { &args[2..] };
+        anyhow::ensure!(!query_args.is_empty(), "query text is required after -d");
         let embedder = if args[1] != "fulltext" {
             let device = witchcraft::make_device();
             Some(witchcraft::Embedder::new(&device, &assets).unwrap())
@@ -874,7 +884,7 @@ fn main() -> Result<()> {
         let mut cache = witchcraft::EmbeddingsCache::new(1);
         let db = DB::new_reader(db_name).unwrap();
         validate_semantic_search(&db, embedder.as_ref())?;
-        let q = &args[2..].join(" ");
+        let q = &query_args.join(" ");
         let use_fulltext = args[1] == "hybrid" || args[1] == "fulltext";
         witchcraft::reset_bucket_io_counters();
         let results =
@@ -898,7 +908,9 @@ fn main() -> Result<()> {
             }
         }
         witchcraft::log_bucket_io_counters();
-        display_image_grid(&image_paths);
+        if display_images {
+            display_image_grid(&image_paths);
+        }
     } else if args.len() >= 4
         && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv" || args[1] == "exactcsv")
     {
@@ -937,7 +949,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query <text> | queryimage <path> | hybrid <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -504,6 +504,15 @@ fn is_supported_image_path(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+fn image_description_from_metadata(metadata: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()?
+        .get("image")?
+        .get("search_text")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 const IMAGE_DISPLAY_SCORE_THRESHOLD: f32 = 0.66;
 
 #[cfg(unix)]
@@ -851,7 +860,7 @@ fn main() -> Result<()> {
             let results =
                 witchcraft::search_embeddings(&db, &query, None, 0.0, 10, None, false)?;
             let mut image_paths = Vec::new();
-            for (score, _metadata, bodies, sub_idx, _date) in results {
+            for (score, metadata, bodies, sub_idx, _date) in results {
                 let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
                 let body = &bodies[idx];
                 let path = PathBuf::from(body);
@@ -860,6 +869,11 @@ fn main() -> Result<()> {
                     continue;
                 }
                 println!("{score}: {body} @ {sub_idx}");
+                if is_image {
+                    if let Some(description) = image_description_from_metadata(&metadata) {
+                        println!("{description}");
+                    }
+                }
                 println!("=============================================");
                 if image_paths.len() < 9 && is_image && !image_paths.contains(&path) {
                     image_paths.push(path);
@@ -891,7 +905,7 @@ fn main() -> Result<()> {
         let results =
             witchcraft::search(&db, embedder.as_ref(), &mut cache, q, 0.0, 10, use_fulltext, None).unwrap();
         let mut image_paths = Vec::new();
-        for (score, _metadata, bodies, sub_idx, _date) in results {
+        for (score, metadata, bodies, sub_idx, _date) in results {
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
             let body = &bodies[idx];
             let path = PathBuf::from(body);
@@ -900,6 +914,11 @@ fn main() -> Result<()> {
                 continue;
             }
             println!("{score}: {body} @ {sub_idx}");
+            if is_image {
+                if let Some(description) = image_description_from_metadata(&metadata) {
+                    println!("{description}");
+                }
+            }
             println!("=============================================");
             if image_paths.len() < 9
                 && is_image

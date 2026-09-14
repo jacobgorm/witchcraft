@@ -441,13 +441,34 @@ fn build_search_text(tags: &ImageTags) -> Option<String> {
         (Some(region), None) => Some(region.clone()),
         (None, None) => None,
     };
-    match (tags.nearby_towns.as_slice(), &tags.nearest_town, area) {
-        (towns, _, Some(area)) if towns.len() > 1 => parts.push(format!("taken near {} in {area}", human_list(towns))),
-        (towns, _, None) if towns.len() > 1 => parts.push(format!("taken near {}", human_list(towns))),
-        (_, Some(town), Some(area)) => parts.push(format!("taken near {town}, {area}")),
-        (_, Some(town), None) => parts.push(format!("taken near {town}")),
-        (_, None, Some(area)) => parts.push(format!("taken in {area}")),
-        (_, None, None) => {},
+    let in_nearest_town = tags
+        .nearest_town_distance_km
+        .is_some_and(|distance| distance.is_finite() && distance <= 10.0);
+    if in_nearest_town {
+        match (&tags.nearest_town, area) {
+            (Some(town), Some(area)) => {
+                let town_and_area = if area == *town || area.starts_with(&format!("{town},")) {
+                    area
+                } else {
+                    format!("{town}, {area}")
+                };
+                parts.push(format!("taken in {town_and_area}"));
+            },
+            (Some(town), None) => parts.push(format!("taken in {town}")),
+            (None, Some(area)) => parts.push(format!("taken in {area}")),
+            (None, None) => {},
+        }
+    } else {
+        match (tags.nearby_towns.as_slice(), &tags.nearest_town, area) {
+            (towns, _, Some(area)) if towns.len() > 1 => {
+                parts.push(format!("taken near {} in {area}", human_list(towns)))
+            },
+            (towns, _, None) if towns.len() > 1 => parts.push(format!("taken near {}", human_list(towns))),
+            (_, Some(town), Some(area)) => parts.push(format!("taken near {town}, {area}")),
+            (_, Some(town), None) => parts.push(format!("taken near {town}")),
+            (_, None, Some(area)) => parts.push(format!("taken in {area}")),
+            (_, None, None) => {},
+        }
     }
     if let Some(season) = &tags.season {
         parts.push(format!("during {season}"));
@@ -620,6 +641,7 @@ mod tests {
             region: Some("Region Zealand".to_string()),
             nearest_town: Some("Roskilde".to_string()),
             nearby_towns: vec!["Roskilde".to_string(), "Køge".to_string(), "Holbæk".to_string()],
+            nearest_town_distance_km: Some(10.1),
             season: Some("winter".to_string()),
             time_of_day: Some("evening".to_string()),
             solar_phase: Some("civil twilight".to_string()),
@@ -631,6 +653,40 @@ mod tests {
         assert!(text.contains("winter"));
         assert!(text.contains("evening"));
         assert!(text.contains("42 metres"));
+    }
+
+    #[test]
+    fn search_text_uses_only_city_when_within_ten_kilometres() {
+        let tags = ImageTags {
+            nearest_town: Some("Copenhagen".to_string()),
+            nearby_towns: vec![
+                "Copenhagen".to_string(),
+                "Roskilde".to_string(),
+                "Helsingør".to_string(),
+            ],
+            nearest_town_distance_km: Some(10.0),
+            region: Some("Capital Region".to_string()),
+            country: Some("Denmark".to_string()),
+            ..ImageTags::default()
+        };
+
+        assert_eq!(
+            build_search_text(&tags).unwrap(),
+            "Photo taken in Copenhagen, Capital Region, Denmark."
+        );
+    }
+
+    #[test]
+    fn search_text_does_not_repeat_city_as_region() {
+        let tags = ImageTags {
+            nearest_town: Some("Stockholm".to_string()),
+            nearest_town_distance_km: Some(2.0),
+            region: Some("Stockholm".to_string()),
+            country: Some("Sweden".to_string()),
+            ..ImageTags::default()
+        };
+
+        assert_eq!(build_search_text(&tags).unwrap(), "Photo taken in Stockholm, Sweden.");
     }
 
     #[test]

@@ -442,7 +442,7 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 fn build_search_text(tags: &ImageTags) -> Option<String> {
-    let mut parts = vec!["Taken".to_string()];
+    let mut parts = vec!["Photographed".to_string()];
     let area = match (&tags.region, &tags.country) {
         (Some(region), Some(country)) if region != country => Some(format!("{region}, {country}")),
         (_, Some(country)) => Some(country.clone()),
@@ -500,7 +500,7 @@ fn build_search_text(tags: &ImageTags) -> Option<String> {
         } else {
             "very high elevation"
         };
-        parts.push(format!("at approximately {:.0} metres altitude, {band}", altitude));
+        parts.push(format!("at {:.0} metres altitude, {band}", altitude));
     }
     (parts.len() > 1).then(|| format!("{}.", parts.join(" ")))
 }
@@ -656,7 +656,7 @@ mod tests {
             ..ImageTags::default()
         };
         let text = build_search_text(&tags).unwrap();
-        assert!(text.starts_with("Taken near Roskilde, Køge, and Holbæk in Region Zealand, Denmark"));
+        assert!(text.starts_with("Photographed near Roskilde, Køge, and Holbæk in Region Zealand, Denmark"));
         assert!(text.contains("winter"));
         assert!(text.contains("evening"));
         assert!(text.contains("42 metres"));
@@ -682,7 +682,7 @@ mod tests {
 
         assert_eq!(
             build_search_text(&tags).unwrap(),
-            "Taken in Copenhagen, Capital Region, Denmark."
+            "Photographed in Copenhagen, Capital Region, Denmark."
         );
     }
 
@@ -696,7 +696,7 @@ mod tests {
             ..ImageTags::default()
         };
 
-        assert_eq!(build_search_text(&tags).unwrap(), "Taken in Stockholm, Sweden.");
+        assert_eq!(build_search_text(&tags).unwrap(), "Photographed in Stockholm, Sweden.");
     }
 
     #[test]

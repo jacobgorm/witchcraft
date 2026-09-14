@@ -442,7 +442,7 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 fn build_search_text(tags: &ImageTags) -> Option<String> {
-    let mut parts = vec!["Photo".to_string()];
+    let mut parts = vec!["Taken".to_string()];
     let area = match (&tags.region, &tags.country) {
         (Some(region), Some(country)) if region != country => Some(format!("{region}, {country}")),
         (_, Some(country)) => Some(country.clone()),
@@ -460,21 +460,19 @@ fn build_search_text(tags: &ImageTags) -> Option<String> {
                 } else {
                     format!("{town}, {area}")
                 };
-                parts.push(format!("taken in {town_and_area}"));
+                parts.push(format!("in {town_and_area}"));
             },
-            (Some(town), None) => parts.push(format!("taken in {town}")),
-            (None, Some(area)) => parts.push(format!("taken in {area}")),
+            (Some(town), None) => parts.push(format!("in {town}")),
+            (None, Some(area)) => parts.push(format!("in {area}")),
             (None, None) => {},
         }
     } else {
         match (tags.nearby_towns.as_slice(), &tags.nearest_town, area) {
-            (towns, _, Some(area)) if towns.len() > 1 => {
-                parts.push(format!("taken near {} in {area}", human_list(towns)))
-            },
-            (towns, _, None) if towns.len() > 1 => parts.push(format!("taken near {}", human_list(towns))),
-            (_, Some(town), Some(area)) => parts.push(format!("taken near {town}, {area}")),
-            (_, Some(town), None) => parts.push(format!("taken near {town}")),
-            (_, None, Some(area)) => parts.push(format!("taken in {area}")),
+            (towns, _, Some(area)) if towns.len() > 1 => parts.push(format!("near {} in {area}", human_list(towns))),
+            (towns, _, None) if towns.len() > 1 => parts.push(format!("near {}", human_list(towns))),
+            (_, Some(town), Some(area)) => parts.push(format!("near {town}, {area}")),
+            (_, Some(town), None) => parts.push(format!("near {town}")),
+            (_, None, Some(area)) => parts.push(format!("in {area}")),
             (_, None, None) => {},
         }
     }
@@ -658,7 +656,7 @@ mod tests {
             ..ImageTags::default()
         };
         let text = build_search_text(&tags).unwrap();
-        assert!(text.starts_with("Photo taken near Roskilde, Køge, and Holbæk in Region Zealand, Denmark"));
+        assert!(text.starts_with("Taken near Roskilde, Køge, and Holbæk in Region Zealand, Denmark"));
         assert!(text.contains("winter"));
         assert!(text.contains("evening"));
         assert!(text.contains("42 metres"));
@@ -684,7 +682,7 @@ mod tests {
 
         assert_eq!(
             build_search_text(&tags).unwrap(),
-            "Photo taken in Copenhagen, Capital Region, Denmark."
+            "Taken in Copenhagen, Capital Region, Denmark."
         );
     }
 
@@ -698,7 +696,7 @@ mod tests {
             ..ImageTags::default()
         };
 
-        assert_eq!(build_search_text(&tags).unwrap(), "Photo taken in Stockholm, Sweden.");
+        assert_eq!(build_search_text(&tags).unwrap(), "Taken in Stockholm, Sweden.");
     }
 
     #[test]

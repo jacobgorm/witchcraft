@@ -346,13 +346,23 @@ fn sigmoid(value: f32) -> f32 {
     }
 }
 
-fn query_weights_from_gate_scores(gate_scores: Vec<f32>) -> Vec<f32> {
+fn is_year_token(token: &str) -> bool {
+    let token = token.trim_start_matches(['Ġ', '▁']);
+    token.len() == 4
+        && token.bytes().all(|byte| byte.is_ascii_digit())
+        && token
+            .parse::<u16>()
+            .is_ok_and(|year| (1000..=2999).contains(&year))
+}
+
+fn query_weights_from_gate_scores(gate_scores: Vec<f32>, tokens: &[String]) -> Vec<f32> {
     gate_scores
         .into_iter()
-        .map(|score| {
+        .zip(tokens)
+        .map(|(score, token)| {
             let weight = sigmoid(score);
             if weight.is_finite() {
-                weight
+                if is_year_token(token) { 1.0 } else { weight }
             } else {
                 1.0
             }
@@ -370,7 +380,7 @@ pub fn embed_query_for_search(embedder: &Embedder, text: &str) -> Result<QueryEm
         let output = embedder.embed_query_with_gate_scores_and_tokens(text)?;
         let weights = output
             .gate_scores
-            .map(query_weights_from_gate_scores)
+            .map(|scores| query_weights_from_gate_scores(scores, &output.tokens))
             .ok_or_else(|| anyhow::anyhow!("WARP_QUERY_TOKEN_SALIENCE requires token_gate tensors in ModernBERT assets"))?;
         Ok(QueryEmbeddings {
             embeddings: output.embeddings.get(0)?,

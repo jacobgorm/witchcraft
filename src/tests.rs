@@ -1,14 +1,25 @@
 #[cfg(test)]
 mod tests {
-    use crate::{
-        DB,
-        EmbeddingCache,
-    };
+    use crate::{is_year_token, query_weights_from_gate_scores, DB, EmbeddingCache};
     use candle_core::{Device, Tensor};
     use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
     use uuid::Uuid;
+
+    #[test]
+    fn query_saliency_keeps_year_tokens_at_full_weight() {
+        let tokens = vec!["Ġphoto".to_string(), "Ġ2016".to_string()];
+        let weights = query_weights_from_gate_scores(vec![0.0, -4.0], &tokens);
+        assert_eq!(weights[0], 0.5);
+        assert_eq!(weights[1], 1.0);
+
+        assert!(is_year_token("2016"));
+        assert!(is_year_token("Ġ2016"));
+        assert!(is_year_token("▁2016"));
+        assert!(!is_year_token("2016s"));
+        assert!(!is_year_token("42"));
+    }
 
     const FACTS : [&str; 33]= [
         "Bananas are berries, but strawberries aren't.",

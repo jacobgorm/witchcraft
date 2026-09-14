@@ -413,11 +413,19 @@ fn solar_tags(elevation: f64, solar_hour: f64) -> (&'static str, &'static str) {
         "daylight"
     };
     let time_of_day = if elevation < -6.0 {
-        "night"
-    } else if solar_hour < 10.0 || (solar_hour < 12.0 && elevation < 10.0) {
-        "morning"
-    } else if solar_hour >= 17.0 || (solar_hour >= 12.0 && elevation < 10.0) {
-        "evening"
+        "nighttime"
+    } else if elevation < 0.0 {
+        if solar_hour < 12.0 {
+            "dawn"
+        } else {
+            "dusk"
+        }
+    } else if elevation < 10.0 {
+        if solar_hour < 12.0 {
+            "dawn"
+        } else {
+            "evening"
+        }
     } else {
         "daytime"
     };
@@ -474,21 +482,10 @@ fn build_search_text(tags: &ImageTags) -> Option<String> {
         parts.push(format!("during {season}"));
     }
     if let Some(time_of_day) = &tags.time_of_day {
-        parts.push(format!("in the {time_of_day}"));
-    }
-    if let Some(phase) = &tags.solar_phase {
-        if tags.time_of_day.as_deref() != Some(phase) {
-            parts.push(format!("with {phase}"));
+        match time_of_day.as_str() {
+            "dawn" | "dusk" | "nighttime" => parts.push(format!("at {time_of_day}")),
+            _ => parts.push(format!("in the {time_of_day}")),
         }
-    }
-    if let Some(model) = &tags.camera_model {
-        let camera = match &tags.camera_make {
-            Some(make) if !model.to_ascii_lowercase().contains(&make.to_ascii_lowercase()) => {
-                format!("{make} {model}")
-            },
-            _ => model.clone(),
-        };
-        parts.push(format!("captured with {camera}"));
     }
     if let Some(captured_at) = &tags.captured_at {
         if let Some(timestamp) = parse_exif_datetime(captured_at) {
@@ -591,10 +588,10 @@ pub fn extract(path: &Path, assets: &Path) -> Result<ImageTags> {
     } else if let Some(local_time) = local_time {
         tags.time_of_day = Some(
             match local_time.hour() {
-                5..=9 => "morning",
-                10..=16 => "daytime",
+                5..=8 => "dawn",
+                9..=16 => "daytime",
                 17..=21 => "evening",
-                _ => "night",
+                _ => "nighttime",
             }
             .to_string(),
         );
@@ -634,6 +631,16 @@ mod tests {
     }
 
     #[test]
+    fn solar_time_uses_five_description_labels() {
+        assert_eq!(solar_tags(-7.0, 2.0).0, "nighttime");
+        assert_eq!(solar_tags(-1.0, 6.0).0, "dawn");
+        assert_eq!(solar_tags(5.0, 8.0).0, "dawn");
+        assert_eq!(solar_tags(20.0, 12.0).0, "daytime");
+        assert_eq!(solar_tags(5.0, 18.0).0, "evening");
+        assert_eq!(solar_tags(-1.0, 18.0).0, "dusk");
+    }
+
+    #[test]
     fn search_text_contains_semantic_time_tags() {
         let tags = ImageTags {
             version: TAG_VERSION,
@@ -645,6 +652,8 @@ mod tests {
             season: Some("winter".to_string()),
             time_of_day: Some("evening".to_string()),
             solar_phase: Some("civil twilight".to_string()),
+            camera_make: Some("Microsoft".to_string()),
+            camera_model: Some("Lumia 930".to_string()),
             altitude_m: Some(42.0),
             ..ImageTags::default()
         };
@@ -653,6 +662,9 @@ mod tests {
         assert!(text.contains("winter"));
         assert!(text.contains("evening"));
         assert!(text.contains("42 metres"));
+        assert!(!text.contains("civil twilight"));
+        assert!(!text.contains("Microsoft"));
+        assert!(!text.contains("Lumia"));
     }
 
     #[test]

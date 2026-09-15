@@ -405,8 +405,6 @@ fn image_description_from_metadata(metadata: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-const IMAGE_DISPLAY_SCORE_THRESHOLD: f32 = 0.66;
-
 type CliSearchResult = (f32, String, Vec<String>, u32, String);
 
 fn print_search_results(results: Vec<CliSearchResult>) -> Vec<PathBuf> {
@@ -416,9 +414,6 @@ fn print_search_results(results: Vec<CliSearchResult>) -> Vec<PathBuf> {
         let body = &bodies[idx];
         let path = PathBuf::from(body);
         let is_image = is_supported_image_path(&path);
-        if is_image && score < IMAGE_DISPLAY_SCORE_THRESHOLD {
-            continue;
-        }
         println!("{score}: {body} @ {sub_idx}");
         if is_image {
             if let Some(description) = image_description_from_metadata(&metadata) {

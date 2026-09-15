@@ -166,7 +166,9 @@ fn image_contact_sheet(paths: &[PathBuf], cell_width: u16, cell_height: u16) -> 
         image::Rgba([0, 0, 0, 255]),
     );
     for (index, path) in paths.iter().take(9).enumerate() {
-        let decoded = match witchcraft::mobileclip2::decode_image(path).map_err(anyhow::Error::from) {
+        let decoded = match witchcraft::mobileclip2::decode_image_oriented(path)
+            .map_err(anyhow::Error::from)
+        {
             Ok(decoded) => decoded,
             Err(error) => {
                 eprintln!("warning: could not display {}: {error}", path.display());

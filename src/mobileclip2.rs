@@ -873,6 +873,27 @@ pub fn decode_image<P: AsRef<Path>>(path: P) -> candle_core::Result<image::Dynam
         .map_err(candle_core::Error::wrap)
 }
 
+pub fn decode_image_oriented<P: AsRef<Path>>(path: P) -> candle_core::Result<image::DynamicImage> {
+    use image::ImageDecoder;
+
+    let path = path.as_ref();
+    let is_heif = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "heic" | "heif"));
+    if is_heif {
+        return decode_image(path);
+    }
+    let mut decoder = image::ImageReader::open(path)
+        .map_err(candle_core::Error::wrap)?
+        .into_decoder()
+        .map_err(candle_core::Error::wrap)?;
+    let orientation = decoder.orientation().map_err(candle_core::Error::wrap)?;
+    let mut image = image::DynamicImage::from_decoder(decoder).map_err(candle_core::Error::wrap)?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
 pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Result<Tensor> {
     let image = decode_image(path)?;
     let image = preprocess_image(image, image_size)?;
@@ -954,4 +975,26 @@ mod image_preprocessing_tests {
         Ok(())
     }
 
+    #[test]
+    fn decoding_applies_exif_orientation() -> candle_core::Result<()> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[255, 0, 0, 0, 0, 255], 2, 1, image::ExtendedColorType::Rgb8)
+            .map_err(candle_core::Error::wrap)?;
+        let exif_orientation_6 = [
+            0xff, 0xe1, 0x00, 0x22, b'E', b'x', b'i', b'f', 0, 0, b'I', b'I', 0x2a, 0, 8, 0, 0,
+            0, 1, 0, 0x12, 1, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        jpeg.splice(2..2, exif_orientation_6);
+        let file = tempfile::Builder::new()
+            .suffix(".jpg")
+            .tempfile()
+            .map_err(candle_core::Error::wrap)?;
+        std::fs::write(file.path(), jpeg).map_err(candle_core::Error::wrap)?;
+
+        let decoded = decode_image_oriented(file.path())?;
+
+        assert_eq!((decoded.width(), decoded.height()), (1, 2));
+        Ok(())
+    }
 }

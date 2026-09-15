@@ -6,6 +6,14 @@ use candle_nn::{
 use candle_transformers::models::fastvit::Config;
 use std::time::{Duration, Instant};
 
+fn apply_conv2d(xs: &Tensor, conv: &Conv2d) -> Result<Tensor> {
+    #[cfg(all(feature = "neso-metal", target_os = "macos"))]
+    if let Some(output) = crate::neso_metal_kernels::image_conv2d(xs, conv)? {
+        return Ok(output);
+    }
+    xs.apply(conv)
+}
+
 #[derive(Clone, Debug)]
 pub struct ProfileRecord {
     pub label: String,
@@ -81,7 +89,7 @@ impl ConvNorm {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply(&self.conv)
+        apply_conv2d(xs, &self.conv)
     }
 }
 
@@ -104,7 +112,7 @@ impl SqueezeExcitation {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let residual = xs;
         let xs = xs.mean_keepdim(D::Minus2)?.mean_keepdim(D::Minus1)?;
-        let xs = sigmoid(&xs.apply(&self.fc1)?.relu()?.apply(&self.fc2)?)?;
+        let xs = sigmoid(&apply_conv2d(&apply_conv2d(&xs, &self.fc1)?.relu()?, &self.fc2)?)?;
         residual.broadcast_mul(&xs)
     }
 }
@@ -199,7 +207,7 @@ impl MobileOneBlock {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut xs = xs.apply(&self.reparam_conv)?;
+        let mut xs = apply_conv2d(xs, &self.reparam_conv)?;
         if let Some(se) = &self.se {
             xs = se.forward(&xs)?;
         }
@@ -217,7 +225,7 @@ impl MobileOneBlock {
         device: &Device,
     ) -> Result<Tensor> {
         let mut xs = profile.time(device, format!("{label}.conv"), || {
-            xs.apply(&self.reparam_conv)
+            apply_conv2d(xs, &self.reparam_conv)
         })?;
         if let Some(se) = &self.se {
             xs = profile.time(device, format!("{label}.se"), || se.forward(&xs))?;
@@ -292,11 +300,9 @@ impl ConvMlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.conv
-            .forward(xs)?
-            .apply(&self.fc1)?
-            .gelu_erf()?
-            .apply(&self.fc2)
+        let xs = self.conv.forward(xs)?;
+        let xs = apply_conv2d(&xs, &self.fc1)?.gelu_erf()?;
+        apply_conv2d(&xs, &self.fc2)
     }
 
     fn forward_profiled(
@@ -307,9 +313,9 @@ impl ConvMlp {
         device: &Device,
     ) -> Result<Tensor> {
         let xs = profile.time(device, format!("{label}.conv"), || self.conv.forward(xs))?;
-        let xs = profile.time(device, format!("{label}.fc1"), || xs.apply(&self.fc1))?;
+        let xs = profile.time(device, format!("{label}.fc1"), || apply_conv2d(&xs, &self.fc1))?;
         let xs = profile.time(device, format!("{label}.gelu"), || xs.gelu_erf())?;
-        profile.time(device, format!("{label}.fc2"), || xs.apply(&self.fc2))
+        profile.time(device, format!("{label}.fc2"), || apply_conv2d(&xs, &self.fc2))
     }
 }
 
@@ -331,7 +337,7 @@ impl PositionalEncoding {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs + xs.apply(&self.conv)?
+        xs + apply_conv2d(xs, &self.conv)?
     }
 
     fn forward_profiled(

@@ -162,8 +162,20 @@ mobileclip2-assets: env/bin/transformers | assets
 		$(PYTHON_BIN) scripts/download_mobileclip2.py; \
 	fi
 
-mobileclip2-xtr-assets: modernbert-assets mobileclip2-assets
+mobileclip2-xtr-assets: mobileclip2-assets
 	@test -f assets/mobileclip2-xtr.safetensors || (echo "missing assets/mobileclip2-xtr.safetensors; run scripts/export_mobileclip2_xtr.py <checkpoint> assets/mobileclip2-xtr.safetensors" >&2; exit 1)
+
+assets/mobileclip2.gguf: assets/mobileclip2.safetensors | assets prereqs
+	cargo run -p quantize --release -- --prefix visual.trunk. assets/mobileclip2.safetensors assets/mobileclip2.gguf
+
+assets/mobileclip2-xtr.gguf: assets/mobileclip2-xtr.safetensors | assets prereqs
+	cargo run -p quantize --release -- assets/mobileclip2-xtr.safetensors assets/mobileclip2-xtr.gguf
+
+mobileclip2-xtr-quantized-assets: \
+	modernbert-quantized-assets \
+	mobileclip2-xtr-assets \
+	assets/mobileclip2.gguf \
+	assets/mobileclip2-xtr.gguf
 
 geotag-assets: env/pyvenv.cfg | assets
 	$(PYTHON_BIN) scripts/download_geotag_assets.py
@@ -174,6 +186,10 @@ else ifeq ($(ENCODER),modernbert-quantized)
 DOWNLOAD_TARGETS := modernbert-quantized-assets
 else ifeq ($(ENCODER),mobileclip2)
 DOWNLOAD_TARGETS := mobileclip2-assets
+else ifeq ($(ENCODER),mobileclip2-modernbert)
+DOWNLOAD_TARGETS := modernbert-assets mobileclip2-xtr-assets
+else ifeq ($(ENCODER),mobileclip2-modernbert-quantized)
+DOWNLOAD_TARGETS := mobileclip2-xtr-quantized-assets
 else
 DOWNLOAD_TARGETS := assets assets/xtr-config.json assets/xtr-tokenizer.json assets/xtr.gguf
 endif
@@ -265,7 +281,7 @@ mobileclip2-bench: prereqs mobileclip2-assets
 	if [ "$(PROFILE)" = "1" ] || [ "$(PROFILE)" = "true" ] || [ "$(PROFILE)" = "yes" ] || [ "$(PROFILE)" = "on" ]; then profile_arg="profile"; fi; \
 	cargo run --release $(BUILD_TARGET) --no-default-features --features $(MOBILECLIP2_CLI_FEATURES) --bin warp-cli -- benchimage "$(IMAGE)" $$profile_arg
 
-mobileclip2-xtr: prereqs mobileclip2-xtr-assets
+mobileclip2-xtr: prereqs download
 	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES),mobileclip2 --bin warp-cli
 	ln -sf $(CLI_BIN) ./warp-cli
 
@@ -378,6 +394,8 @@ distclean:
 	macintel \
 	mobileclip2-assets \
 	mobileclip2-bench \
+	mobileclip2-xtr-assets \
+	mobileclip2-xtr-quantized-assets \
 	geotag-assets \
 	modernbert-assets \
 	modernbert-quantized-assets \

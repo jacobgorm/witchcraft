@@ -1389,9 +1389,9 @@ pub fn cache_image_embeddings_auto_many<F>(
 where
     F: FnMut(&std::path::Path, u64, usize),
 {
-    // Eight 512x512 images keeps MobileCLIP2's intermediate activations at a
-    // conservative size on Apple Silicon while still amortizing model launch.
-    const IMAGE_EMBED_BATCH_SIZE: usize = 8;
+    // Four images balances parallel CPU preparation with near-peak Neso Metal
+    // throughput while keeping intermediate activations conservative.
+    const IMAGE_EMBED_BATCH_SIZE: usize = 4;
     let mut pending_paths = Vec::with_capacity(paths.len());
     let mut results = Vec::with_capacity(paths.len());
     for path in paths {
@@ -1412,40 +1412,90 @@ where
         }
         pending_paths.push(path.clone());
     }
-    for batch_paths in pending_paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
-        let mut valid_paths = Vec::with_capacity(batch_paths.len());
-        let mut images = Vec::with_capacity(batch_paths.len());
-        for path in batch_paths {
-            match crate::mobileclip2::load_image(path, embedder.image_size()) {
-                Ok(image) => {
-                    valid_paths.push(path);
-                    images.push(image);
-                }
-                Err(error) => {
-                    log::warn!("skipping image {}: {error}", path.display());
+    // Decode/resize images and extract metadata on CPU workers while the caller
+    // embeds and persists the preceding batch. Two prefetched batches bound the
+    // CPU tensor memory to roughly 50 MiB for 512x512 RGB inputs.
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(2);
+    let image_size = embedder.image_size();
+    let image_assets = embedder.assets_path().to_path_buf();
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for batch_paths in pending_paths.chunks(IMAGE_EMBED_BATCH_SIZE) {
+                let prepared = std::thread::scope(|decode_scope| {
+                    let workers = batch_paths
+                        .iter()
+                        .map(|path| {
+                            let path = path.clone();
+                            let image_assets = &image_assets;
+                            decode_scope.spawn(move || {
+                                let image = crate::mobileclip2::load_image(
+                                    &path,
+                                    image_size,
+                                )
+                                .map_err(anyhow::Error::from);
+                                let tags = image_tags_for_path(&path, &image_assets);
+                                (path, image, tags)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("image preparation worker panicked"))
+                        .collect::<Vec<_>>()
+                });
+                if prepared_tx.send(prepared).is_err() {
+                    break;
                 }
             }
+        });
+
+        let mut pipeline_error = None;
+        while let Ok(prepared) = prepared_rx.recv() {
+            let batch_result = (|| -> Result<()> {
+                let mut valid = Vec::with_capacity(prepared.len());
+                let mut images = Vec::with_capacity(prepared.len());
+                for (path, image, tags) in prepared {
+                    match image {
+                        Ok(image) => {
+                            valid.push((path, tags));
+                            images.push(image);
+                        },
+                        Err(error) => {
+                            log::warn!("skipping image {}: {error}", path.display());
+                        },
+                    }
+                }
+                if images.is_empty() {
+                    return Ok(());
+                }
+                let batch = Tensor::stack(&images, 0)?;
+                let outputs = embedder.embed_image_tensor(&batch)?;
+                for (index, (path, tags)) in valid.into_iter().enumerate() {
+                    let output = outputs.narrow(0, index, 1)?;
+                    let embeddings = crate::cached_image_embeddings_from_output(output)?;
+                    let embeddings = add_image_tag_embeddings(embedder, embeddings, &tags)?;
+                    let result = cache_image_embeddings_auto_from_output(
+                        db,
+                        &path,
+                        embeddings,
+                        &tags,
+                    )?;
+                    on_embedded(&path, result.0, result.1);
+                    results.push(result);
+                }
+                Ok(())
+            })();
+            if let Err(error) = batch_result {
+                pipeline_error = Some(error);
+                break;
+            }
         }
-        if images.is_empty() {
-            continue;
+        drop(prepared_rx);
+        match pipeline_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        let batch = Tensor::stack(&images, 0)?;
-        let outputs = embedder.embed_image_tensor(&batch)?;
-        for (index, path) in valid_paths.into_iter().enumerate() {
-            let output = outputs.narrow(0, index, 1)?;
-            let tags = image_tags_for_path(path, embedder.assets_path());
-            let embeddings = crate::cached_image_embeddings_from_output(output)?;
-            let embeddings = add_image_tag_embeddings(embedder, embeddings, &tags)?;
-            let result = cache_image_embeddings_auto_from_output(
-                db,
-                path,
-                embeddings,
-                &tags,
-            )?;
-            on_embedded(path, result.0, result.1);
-            results.push(result);
-        }
-    }
+    })?;
     Ok(results)
 }
 

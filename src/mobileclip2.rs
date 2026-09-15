@@ -1,17 +1,21 @@
 //! MobileCLIP2-S0 image and text encoder using Candle.
 
+use std::io::Error;
+use std::path::Path;
+#[cfg(not(feature = "embed-assets"))]
+use std::path::PathBuf;
+
+#[cfg(feature = "modernbert-quantized")]
+use candle_core::quantized::gguf_file;
 use candle_core::{DType, Device, Module, Result, Tensor};
-use candle_nn::{Linear, VarBuilder};
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 use candle_nn::{layer_norm, linear, linear_no_bias, LayerNorm};
-use candle_transformers::models::{fastvit, openclip::text_model};
+use candle_nn::{Linear, VarBuilder};
+use candle_transformers::models::fastvit;
+use candle_transformers::models::openclip::text_model;
 use serde::Deserialize;
-use std::io::Error;
-use std::path::{Path, PathBuf};
+#[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
 use tokenizers::Tokenizer;
-
-use crate::profiled_fastvit::ProfiledFastVit;
-pub use crate::profiled_fastvit::{ImageProfile, ProfileRecord};
 
 #[cfg(any(
     feature = "embed-assets",
@@ -19,15 +23,24 @@ pub use crate::profiled_fastvit::{ImageProfile, ProfileRecord};
     feature = "modernbert-quantized"
 ))]
 use crate::embed_asset;
+use crate::profiled_fastvit::ProfiledFastVit;
+pub use crate::profiled_fastvit::{ImageProfile, ProfileRecord};
 
 #[cfg(feature = "embed-assets")]
 embed_asset!(pub CONFIG, "mobileclip2-config.json");
-#[cfg(feature = "embed-assets")]
+#[cfg(all(
+    feature = "embed-assets",
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 embed_asset!(pub TOKENIZER, "mobileclip2-tokenizer.json");
-#[cfg(feature = "embed-assets")]
+#[cfg(all(feature = "embed-assets", not(feature = "modernbert-quantized")))]
 embed_asset!(pub MODEL, "mobileclip2.safetensors");
-#[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
+#[cfg(feature = "modernbert")]
 embed_asset!(pub XTR_ADAPTER, "mobileclip2-xtr.safetensors");
+#[cfg(feature = "modernbert-quantized")]
+embed_asset!(pub QUANTIZED_MODEL, "mobileclip2.gguf");
+#[cfg(feature = "modernbert-quantized")]
+embed_asset!(pub QUANTIZED_XTR_ADAPTER, "mobileclip2-xtr.gguf");
 
 const DEFAULT_CONTEXT_LENGTH: usize = 77;
 const DEFAULT_EMBED_DIM: usize = 512;
@@ -42,18 +55,24 @@ const DEFAULT_VOCAB_SIZE: usize = 49408;
 
 #[cfg(not(feature = "embed-assets"))]
 const CONFIG_ENV: &str = "WARP_MOBILECLIP2_CONFIG";
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(
+    not(feature = "embed-assets"),
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 const TOKENIZER_ENV: &str = "WARP_MOBILECLIP2_TOKENIZER";
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 const WEIGHTS_ENV: &str = "WARP_MOBILECLIP2_WEIGHTS";
 
 #[cfg(not(feature = "embed-assets"))]
 const CONFIG_CANDIDATES: &[&str] = &["mobileclip2-config.json", "open_clip_config.json"];
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(
+    not(feature = "embed-assets"),
+    not(any(feature = "modernbert", feature = "modernbert-quantized"))
+))]
 const TOKENIZER_CANDIDATES: &[&str] = &["mobileclip2-tokenizer.json", "open_clip_tokenizer.json"];
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 const SAFETENSOR_CANDIDATES: &[&str] = &["mobileclip2.safetensors", "open_clip_model.safetensors"];
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 const PTH_CANDIDATES: &[&str] = &["mobileclip2_s0.pt", "open_clip_pytorch_model.bin"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +81,7 @@ struct Config {
     embed_dim: usize,
     #[serde(default)]
     vision_cfg: VisionConfig,
+    #[cfg_attr(any(feature = "modernbert", feature = "modernbert-quantized"), allow(dead_code))]
     text_cfg: TextConfig,
 }
 
@@ -70,10 +90,12 @@ struct VisionConfig {
     #[serde(default = "default_vision_model_name")]
     timm_model_name: String,
     #[serde(default = "default_image_size")]
+    #[cfg_attr(any(feature = "modernbert", feature = "modernbert-quantized"), allow(dead_code))]
     image_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(any(feature = "modernbert", feature = "modernbert-quantized"), allow(dead_code))]
 struct TextConfig {
     #[serde(default = "default_context_length")]
     context_length: usize,
@@ -153,6 +175,7 @@ impl Config {
             .map_err(|e| Error::other(format!("failed to parse MobileCLIP2 model_cfg: {e}")).into())
     }
 
+    #[cfg_attr(any(feature = "modernbert", feature = "modernbert-quantized"), allow(dead_code))]
     fn text_model_config(&self) -> text_model::Config {
         let width = self.text_cfg.width;
         text_model::Config {
@@ -387,52 +410,109 @@ pub struct XtrImageEncoder {
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 impl XtrImageEncoder {
     pub fn load(device: &Device, assets: &Path) -> Result<Self> {
-        let (builder, _) = T5ModelBuilder::load(assets)?;
-        let vision_config = builder.config.vision_model_config()?;
-        let mobileclip_vb = load_weights(device, assets)?;
+        let config = load_config(assets)?;
+        let vision_config = config.vision_model_config()?;
+        let mobileclip_vb = load_xtr_weights(device, assets)?;
         let vision_model = ProfiledFastVit::new(
             &vision_config,
-            builder.config.embed_dim,
+            config.embed_dim,
             mobileclip_vb.pp("visual.trunk"),
         )?;
-        let adapter_bytes = XTR_ADAPTER
-            .bytes(assets)
-            .map_err(|_| Error::other("failed to read mobileclip2-xtr.safetensors"))?;
-        let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes)
-            .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR asset: {e}")))?;
-        let (_, header) = safetensors::SafeTensors::read_metadata(&adapter_bytes)
-            .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR metadata: {e}")))?;
-        let metadata = header.metadata().as_ref();
-        let adapter_type = metadata
-            .and_then(|values| values.get("adapter_type"))
-            .map(String::as_str)
-            .unwrap_or_else(|| {
-                if tensors.names().contains(&"base.net.0.weight") {
+
+        #[cfg(feature = "modernbert")]
+        let (
+            adapter_vb,
+            adapter_type,
+            residual_scale,
+            image_tokens,
+            has_output_scale,
+            has_output_bias,
+        ) = {
+            let adapter_bytes = XTR_ADAPTER
+                .bytes(assets)
+                .map_err(|_| Error::other("failed to read mobileclip2-xtr.safetensors"))?;
+            let tensors = safetensors::SafeTensors::deserialize(&adapter_bytes)
+                .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR asset: {e}")))?;
+            let (_, header) = safetensors::SafeTensors::read_metadata(&adapter_bytes)
+                .map_err(|e| Error::other(format!("invalid MobileCLIP2 XTR metadata: {e}")))?;
+            let metadata = header.metadata().as_ref();
+            let adapter_type = metadata
+                .and_then(|values| values.get("adapter_type"))
+                .map(String::as_str)
+                .unwrap_or_else(|| {
+                    if tensors.names().contains(&"base.net.0.weight") {
+                        "residual_mlp"
+                    } else {
+                        "gated_mlp"
+                    }
+                });
+            let residual_scale = metadata
+                .and_then(|values| values.get("residual_scale"))
+                .map(|value| value.parse::<f64>())
+                .transpose()
+                .map_err(|e| Error::other(format!("invalid residual_scale metadata: {e}")))?;
+            let image_tokens = metadata
+                .and_then(|values| values.get("image_tokens"))
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
+            let has_output_scale = tensors.names().contains(&"output_scale");
+            let has_output_bias = tensors.names().contains(&"output_bias");
+            let adapter_vb =
+                VarBuilder::from_buffered_safetensors(adapter_bytes.to_vec(), DType::F32, device)?;
+            (
+                adapter_vb,
+                adapter_type.to_string(),
+                residual_scale,
+                image_tokens,
+                has_output_scale,
+                has_output_bias,
+            )
+        };
+
+        #[cfg(feature = "modernbert-quantized")]
+        let (
+            adapter_vb,
+            adapter_type,
+            residual_scale,
+            image_tokens,
+            has_output_scale,
+            has_output_bias,
+        ) = {
+            let adapter_bytes = QUANTIZED_XTR_ADAPTER
+                .bytes(assets)
+                .map_err(|_| Error::other("failed to read mobileclip2-xtr.gguf"))?;
+            let (adapter_vb, metadata) = load_gguf_weights(adapter_bytes, device)?;
+            let adapter_type = gguf_string(&metadata, "adapter_type").unwrap_or_else(|| {
+                if adapter_vb.contains_tensor("base.net.0.weight") {
                     "residual_mlp"
                 } else {
                     "gated_mlp"
                 }
             });
-        let residual_scale = metadata
-            .and_then(|values| values.get("residual_scale"))
-            .map(|value| value.parse::<f64>())
-            .transpose()
-            .map_err(|e| Error::other(format!("invalid residual_scale metadata: {e}")))?;
-        let image_tokens = metadata
-            .and_then(|values| values.get("image_tokens"))
-            .map(|value| value.parse::<usize>())
-            .transpose()
-            .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
-        let has_output_scale = tensors.names().contains(&"output_scale");
-        let has_output_bias = tensors.names().contains(&"output_bias");
-        let adapter_vb = VarBuilder::from_buffered_safetensors(
-            adapter_bytes.to_vec(),
-            DType::F32,
-            device,
-        )?;
+            let residual_scale = gguf_string(&metadata, "residual_scale")
+                .map(str::parse::<f64>)
+                .transpose()
+                .map_err(|e| Error::other(format!("invalid residual_scale metadata: {e}")))?;
+            let image_tokens = gguf_string(&metadata, "image_tokens")
+                .map(str::parse::<usize>)
+                .transpose()
+                .map_err(|e| Error::other(format!("invalid image_tokens metadata: {e}")))?;
+            let has_output_scale = adapter_vb.contains_tensor("output_scale");
+            let has_output_bias = adapter_vb.contains_tensor("output_bias");
+            (
+                adapter_vb,
+                adapter_type.to_string(),
+                residual_scale,
+                image_tokens,
+                has_output_scale,
+                has_output_bias,
+            )
+        };
+
         let adapter = XtrImageAdapter::load(
             adapter_vb,
-            adapter_type,
+            &adapter_type,
             residual_scale,
             image_tokens,
             has_output_scale,
@@ -473,6 +553,7 @@ impl XtrImageEncoder {
 }
 
 impl T5EncoderModel {
+    #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let text_config = cfg.text_model_config();
         let text_model = text_model::OpenClipTextTransformer::new(vb.pp("text"), &text_config)?;
@@ -539,29 +620,35 @@ impl T5EncoderModel {
     }
 }
 
+#[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
 pub struct T5ModelBuilder {
     config: Config,
 }
 
+fn load_config(assets: &Path) -> candle_core::Result<Config> {
+    #[cfg(feature = "embed-assets")]
+    return Config::from_json(
+        CONFIG
+            .bytes(assets)
+            .map_err(|_| Error::other("failed to read embedded mobileclip2-config.json"))?,
+    );
+
+    #[cfg(not(feature = "embed-assets"))]
+    match find_asset_path(CONFIG_ENV, CONFIG_CANDIDATES, assets) {
+        Some(path) => Config::from_json(&std::fs::read(&path).map_err(|e| {
+            Error::other(format!(
+                "failed to read MobileCLIP2 config {}: {e}",
+                path.display()
+            ))
+        })?),
+        None => Ok(Config::default()),
+    }
+}
+
+#[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
 impl T5ModelBuilder {
     pub fn load(assets: &Path) -> candle_core::Result<(Self, Tokenizer)> {
-        #[cfg(feature = "embed-assets")]
-        let config = Config::from_json(
-            CONFIG
-                .bytes(assets)
-                .map_err(|_| Error::other("failed to read embedded mobileclip2-config.json"))?,
-        )?;
-
-        #[cfg(not(feature = "embed-assets"))]
-        let config = match find_asset_path(CONFIG_ENV, CONFIG_CANDIDATES, assets) {
-            Some(path) => Config::from_json(&std::fs::read(&path).map_err(|e| {
-                Error::other(format!(
-                    "failed to read MobileCLIP2 config {}: {e}",
-                    path.display()
-                ))
-            })?)?,
-            None => Config::default(),
-        };
+        let config = load_config(assets)?;
 
         #[cfg(feature = "embed-assets")]
         let tokenizer = Tokenizer::from_bytes(
@@ -608,6 +695,54 @@ impl T5ModelBuilder {
     }
 }
 
+#[cfg(feature = "modernbert-quantized")]
+fn gguf_string<'a>(
+    metadata: &'a std::collections::HashMap<String, gguf_file::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    match metadata.get(key) {
+        Some(gguf_file::Value::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "modernbert-quantized")]
+fn load_gguf_weights(
+    bytes: &[u8],
+    device: &Device,
+) -> candle_core::Result<(
+    VarBuilder<'static>,
+    std::collections::HashMap<String, gguf_file::Value>,
+)> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let content = gguf_file::Content::read(&mut cursor)?;
+    let names = content.tensor_infos.keys().cloned().collect::<Vec<_>>();
+    let mut tensors = std::collections::HashMap::with_capacity(names.len());
+    for name in names {
+        let tensor = content
+            .tensor(&mut cursor, &name, device)?
+            .dequantize(device)?;
+        tensors.insert(name, tensor);
+    }
+    Ok((
+        VarBuilder::from_tensors(tensors, DType::F32, device),
+        content.metadata,
+    ))
+}
+
+#[cfg(feature = "modernbert-quantized")]
+fn load_xtr_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilder<'static>> {
+    let bytes = QUANTIZED_MODEL
+        .bytes(assets)
+        .map_err(|_| Error::other("failed to read mobileclip2.gguf"))?;
+    load_gguf_weights(bytes, device).map(|(vb, _)| vb)
+}
+
+#[cfg(feature = "modernbert")]
+fn load_xtr_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilder<'static>> {
+    load_weights(device, assets)
+}
+
 #[cfg(not(feature = "embed-assets"))]
 fn find_asset_path(env_var: &str, candidates: &[&str], assets: &Path) -> Option<PathBuf> {
     if let Some(path) = find_env_path(env_var) {
@@ -631,7 +766,7 @@ fn find_candidate_path(candidates: &[&str], assets: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-#[cfg(feature = "embed-assets")]
+#[cfg(all(feature = "embed-assets", not(feature = "modernbert-quantized")))]
 fn load_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilder<'static>> {
     let model_bytes = MODEL
         .bytes(assets)
@@ -639,7 +774,7 @@ fn load_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilde
     VarBuilder::from_slice_safetensors(model_bytes, DType::F32, device)
 }
 
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 fn load_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilder<'static>> {
     if let Some(path) = find_env_path(WEIGHTS_ENV) {
         return load_weight_path(path, device);
@@ -660,7 +795,7 @@ fn load_weights(device: &Device, assets: &Path) -> candle_core::Result<VarBuilde
     .into())
 }
 
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 fn load_weight_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBuilder<'static>> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("safetensors") => load_safetensors_path(path, device),
@@ -673,7 +808,7 @@ fn load_weight_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBu
     }
 }
 
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 fn load_safetensors_path(
     path: PathBuf,
     device: &Device,
@@ -681,7 +816,7 @@ fn load_safetensors_path(
     unsafe { VarBuilder::from_mmaped_safetensors(&[path], DType::F32, device) }
 }
 
-#[cfg(not(feature = "embed-assets"))]
+#[cfg(all(not(feature = "embed-assets"), not(feature = "modernbert-quantized")))]
 fn load_pth_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBuilder<'static>> {
     VarBuilder::from_pth(path, DType::F32, device)
 }

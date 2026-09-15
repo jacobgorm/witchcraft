@@ -11,6 +11,15 @@ The function_name refers to an @triton.jit function in encoder_kernels.py.
 # BM=32, BN=32, D=64: constexpr
 
 METAL_KERNELS = [
+    ("depthwise_conv2d_k3_256", "depthwise_conv2d_k3_forward",
+     "*fp32:16, *fp32:16, *fp32:16, *fp32:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, 128",
+     4, ["cdiv(out_width, 128)", "batch * output_channels * out_height", "1"]),
+    ("depthwise_conv2d_k7_256", "depthwise_conv2d_k7_forward",
+     "*fp32:16, *fp32:16, *fp32:16, *fp32:16, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, 64",
+     4, ["cdiv(out_width, 64)", "batch * output_channels * out_height", "1"]),
+    ("pointwise_conv2d_f32_16x32", "pointwise_conv2d_f32_forward",
+     "*fp32:16, *fp32:16, *fp32:16, i32, i32, i32, i32, 16, 32, 32",
+     4, ["cdiv(output_channels, 16)", "cdiv(spatial_size, 32)", "1"]),
     ("copy_f32_f16_1024", "copy_f32_f16_forward",
      "*fp32:16, *fp16:16, i32, 1024",
      4, ["cdiv(n_elements, 1024)", "1", "1"]),
@@ -68,6 +77,18 @@ HLSL_EXTRA_KERNELS = [
 ]
 
 KERNEL_METADATA = {
+    "depthwise_conv2d_k3_256": {
+        "alias": "depthwise_conv2d_k3",
+        "group": "image",
+    },
+    "depthwise_conv2d_k7_256": {
+        "alias": "depthwise_conv2d_k7",
+        "group": "image",
+    },
+    "pointwise_conv2d_f32_16x32": {
+        "alias": "pointwise_conv2d_f32",
+        "group": "image",
+    },
     "copy_f32_f16_1024": {
         "alias": "copy_f32_f16",
         "group": "encoder",

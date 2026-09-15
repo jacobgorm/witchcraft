@@ -10,6 +10,288 @@ import triton.language as tl
 
 
 @triton.jit
+def _depthwise_tap(
+    x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+    batch, input_channels, height, width, stride, padding,
+    KY: tl.constexpr, KX: tl.constexpr, KERNEL: tl.constexpr,
+):
+    iy = spatial_row * stride + KY - padding
+    ix = ox * stride + KX - padding
+    valid = ((ox < width) & (iy >= 0) & (iy < height) &
+             (ix >= 0) & (ix < width) & (batch_idx < batch))
+    x_offset = ((batch_idx * input_channels + channel) * height + iy) * width + ix
+    value = tl.load(x_ptr + x_offset, mask=valid, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptr + KY * KERNEL + KX).to(tl.float32)
+    return value * weight
+
+
+@triton.jit
+def depthwise_conv2d_k3_forward(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    batch, input_channels, output_channels, height, width, out_height, out_width,
+    stride, padding, has_bias,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """NCHW 3x3 depthwise convolution with fp32 accumulation."""
+    row = tl.program_id(1)
+    ox = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    spatial_row = row % out_height
+    output_channel = (row // out_height) % output_channels
+    batch_idx = row // (out_height * output_channels)
+    input_channel = output_channel * input_channels // output_channels
+    channel = input_channel
+    channels = input_channels
+    weight_ptr = weight_ptr + output_channel * 9
+    acc = (
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 0, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 1, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 2, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 0, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 1, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 2, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 0, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 1, 3) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 2, 3)
+    )
+    bias = tl.load(bias_ptr + output_channel, mask=(has_bias != 0) & (batch_idx < batch), other=0.0).to(tl.float32)
+    out_offset = row * out_width + ox
+    tl.store(out_ptr + out_offset, acc + bias, mask=(ox < out_width) & (batch_idx < batch))
+
+
+@triton.jit
+def depthwise_conv2d_k7_forward(
+    x_ptr, weight_ptr, bias_ptr, out_ptr,
+    batch, input_channels, output_channels, height, width, out_height, out_width,
+    stride, padding, has_bias,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """NCHW 7x7 depthwise convolution with fp32 accumulation."""
+    row = tl.program_id(1)
+    ox = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    spatial_row = row % out_height
+    output_channel = (row // out_height) % output_channels
+    batch_idx = row // (out_height * output_channels)
+    input_channel = output_channel * input_channels // output_channels
+    channel = input_channel
+    channels = input_channels
+    weight_ptr = weight_ptr + output_channel * 49
+    acc = (
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       0, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       1, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       2, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       3, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       4, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       5, 6, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 0, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 1, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 2, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 3, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 4, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 5, 7) +
+        _depthwise_tap(x_ptr, weight_ptr, batch_idx, channel, spatial_row, ox,
+                       batch, channels, height, width, stride, padding,
+                       6, 6, 7)
+    )
+    bias = tl.load(bias_ptr + output_channel, mask=(has_bias != 0) & (batch_idx < batch), other=0.0).to(tl.float32)
+    out_offset = row * out_width + ox
+    tl.store(out_ptr + out_offset, acc + bias, mask=(ox < out_width) & (batch_idx < batch))
+
+
+@triton.jit
+def pointwise_conv2d_f32_forward(
+    weight_ptr, x_ptr, out_ptr,
+    output_stride, spatial_size, input_channels, output_channels,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Single-batch NCHW 1x1 convolution as a matrix multiplication."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    weight_ptrs = weight_ptr + offs_m[:, None] * input_channels + offs_k[None, :]
+    x_ptrs = x_ptr + offs_k[:, None] * spatial_size + offs_n[None, :]
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, input_channels, BLOCK_K):
+        weight = tl.load(
+            weight_ptrs,
+            mask=(offs_m[:, None] < output_channels) &
+                 (offs_k[None, :] + k < input_channels),
+            other=0.0,
+        ).to(tl.float32)
+        x = tl.load(
+            x_ptrs,
+            mask=(offs_k[:, None] + k < input_channels) &
+                 (offs_n[None, :] < spatial_size),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.dot(weight, x, input_precision="ieee")
+        weight_ptrs += BLOCK_K
+        x_ptrs += BLOCK_K * spatial_size
+
+    out_ptrs = out_ptr + offs_m[:, None] * output_stride + offs_n[None, :]
+    tl.store(
+        out_ptrs,
+        acc,
+        mask=(offs_m[:, None] < output_channels) &
+             (offs_n[None, :] < spatial_size),
+    )
+
+
+
+@triton.jit
 def copy_f32_f16_forward(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     """Convert a contiguous fp32 residual stream to fp16."""
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)

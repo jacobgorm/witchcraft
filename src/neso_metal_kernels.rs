@@ -6,16 +6,280 @@
 
 use anyhow::Result;
 pub use candle_core::GpuBuffer;
-use candle_core::{MetalDevice, Storage, Tensor};
+use candle_core::{DType, MetalDevice, Storage, Tensor};
+use candle_nn::Conv2d;
 use candle_metal_kernels::metal::{ComputeCommandEncoder, ComputePipeline, Device, Library};
 use dispatch2::DispatchData;
 use objc2_metal::MTLSize;
+use once_cell::sync::OnceCell;
 
 // Auto-generated: kernel data and Neso pipeline loader.
 include!(concat!(env!("OUT_DIR"), "/neso_metal_gen.rs"));
 
 fn cdiv(a: usize, b: usize) -> usize {
     (a + b - 1) / b
+}
+
+static IMAGE_KERNELS: OnceCell<NesoKernels> = OnceCell::new();
+
+fn image_kernels(device: &MetalDevice) -> candle_core::Result<&'static NesoKernels> {
+    IMAGE_KERNELS.get_or_try_init(|| NesoKernels::load(device).map_err(candle_core::Error::wrap))
+}
+
+/// Use Neso for the image convolutions with optimized kernels.
+pub fn image_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    if let Some(output) = depthwise_conv2d(x, conv)? {
+        return Ok(Some(output));
+    }
+    pointwise_conv2d(x, conv)
+}
+
+/// Use Neso for contiguous fp32 NCHW depthwise convolutions used by FastViT.
+pub fn depthwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    let candle_core::Device::Metal(device) = x.device() else {
+        return Ok(None);
+    };
+    let cfg = conv.config();
+    let (batch, channels, height, width) = x.dims4()?;
+    let (out_channels, channels_per_group, kernel_h, kernel_w) = conv.weight().dims4()?;
+    if x.dtype() != DType::F32
+        || conv.weight().dtype() != DType::F32
+        || out_channels % channels != 0
+        || cfg.groups != channels
+        || channels_per_group != 1
+        || kernel_h != kernel_w
+        || !matches!(kernel_h, 3 | 7)
+        || cfg.dilation != 1
+    {
+        return Ok(None);
+    }
+    let x_contiguous = {
+        let (_storage, layout) = x.storage_and_layout();
+        layout.is_contiguous()
+    };
+    let weight_contiguous = {
+        let (_storage, layout) = conv.weight().storage_and_layout();
+        layout.is_contiguous()
+    };
+    if !x_contiguous || !weight_contiguous {
+        return Ok(None);
+    }
+    let out_height = (height + 2 * cfg.padding - kernel_h) / cfg.stride + 1;
+    let out_width = (width + 2 * cfg.padding - kernel_w) / cfg.stride + 1;
+    let out = Tensor::zeros((batch, out_channels, out_height, out_width), DType::F32, x.device())?;
+    let kernels = image_kernels(device)?;
+    let pipeline = match kernel_h {
+        3 => &kernels.depthwise_conv2d_k3,
+        7 => &kernels.depthwise_conv2d_k7,
+        _ => unreachable!(),
+    };
+    let bias = conv.bias().unwrap_or(conv.weight());
+    let (sx, lx) = x.storage_and_layout();
+    let (sw, lw) = conv.weight().storage_and_layout();
+    let (sb, lb) = bias.storage_and_layout();
+    let (so, lo) = out.storage_and_layout();
+    match (&*sx, &*sw, &*sb, &*so) {
+        (Storage::Metal(mx), Storage::Metal(mw), Storage::Metal(mb), Storage::Metal(mo)) => {
+            let encoder = device.command_encoder()?;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(mx.buffer()), lx.start_offset() * 4);
+            encoder.set_buffer(1, Some(mw.buffer()), lw.start_offset() * 4);
+            encoder.set_buffer(2, Some(mb.buffer()), lb.start_offset() * 4);
+            encoder.set_buffer(3, Some(mo.buffer()), lo.start_offset() * 4);
+            encoder.set_bytes(4, &(batch as i32));
+            encoder.set_bytes(5, &(channels as i32));
+            encoder.set_bytes(6, &(out_channels as i32));
+            encoder.set_bytes(7, &(height as i32));
+            encoder.set_bytes(8, &(width as i32));
+            encoder.set_bytes(9, &(out_height as i32));
+            encoder.set_bytes(10, &(out_width as i32));
+            encoder.set_bytes(11, &(cfg.stride as i32));
+            encoder.set_bytes(12, &(cfg.padding as i32));
+            encoder.set_bytes(13, &(conv.bias().is_some() as i32));
+            let threads = if kernel_h == 3 { 128 } else { 64 };
+            let grid = MTLSize {
+                width: cdiv(out_width, threads),
+                height: batch * out_channels * out_height,
+                depth: 1,
+            };
+            encoder.dispatch_thread_groups(grid, tg_size(pipeline, threads));
+            Ok(Some(out.clone()))
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Use a tiled Neso matrix multiplication for contiguous fp32 1x1 convolutions.
+fn pointwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    let candle_core::Device::Metal(device) = x.device() else {
+        return Ok(None);
+    };
+    let cfg = conv.config();
+    let (batch, input_channels, height, width) = x.dims4()?;
+    let (output_channels, channels_per_group, kernel_h, kernel_w) = conv.weight().dims4()?;
+    if x.dtype() != DType::F32
+        || conv.weight().dtype() != DType::F32
+        || channels_per_group != input_channels
+        || kernel_h != 1
+        || kernel_w != 1
+        || cfg.groups != 1
+        || cfg.stride != 1
+        || cfg.padding != 0
+        || cfg.dilation != 1
+        || input_channels % 32 != 0
+        || output_channels % 16 != 0
+        || height * width % 32 != 0
+    {
+        return Ok(None);
+    }
+    let contiguous = |tensor: &Tensor| {
+        let (_storage, layout) = tensor.storage_and_layout();
+        layout.is_contiguous()
+    };
+    if !contiguous(x) || !contiguous(conv.weight()) {
+        return Ok(None);
+    }
+
+    let spatial_size = height * width;
+    let out = Tensor::zeros(
+        (batch, output_channels, height, width),
+        DType::F32,
+        x.device(),
+    )?;
+    let (sx, lx) = x.storage_and_layout();
+    let (sw, lw) = conv.weight().storage_and_layout();
+    let (so, lo) = out.storage_and_layout();
+    match (&*sx, &*sw, &*so) {
+        (Storage::Metal(mx), Storage::Metal(mw), Storage::Metal(mo)) => {
+            let pipeline = &image_kernels(device)?.pointwise_conv2d_f32;
+            let encoder = device.command_encoder()?;
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(mw.buffer()), lw.start_offset() * 4);
+            encoder.set_bytes(3, &(spatial_size as i32));
+            encoder.set_bytes(4, &(spatial_size as i32));
+            encoder.set_bytes(5, &(input_channels as i32));
+            encoder.set_bytes(6, &(output_channels as i32));
+            let grid = MTLSize {
+                width: cdiv(output_channels, 16),
+                height: cdiv(spatial_size, 32),
+                depth: 1,
+            };
+            for batch_index in 0..batch {
+                encoder.set_buffer(
+                    1,
+                    Some(mx.buffer()),
+                    (lx.start_offset() + batch_index * input_channels * spatial_size) * 4,
+                );
+                encoder.set_buffer(
+                    2,
+                    Some(mo.buffer()),
+                    (lo.start_offset() + batch_index * output_channels * spatial_size) * 4,
+                );
+                encoder.dispatch_thread_groups(grid, tg_size(pipeline, 256));
+            }
+            // Finish recording the custom kernel before Candle records the bias add.
+            drop(encoder);
+            let out = match conv.bias() {
+                Some(bias) => out.broadcast_add(&bias.reshape((1, output_channels, 1, 1))?)?,
+                None => out.clone(),
+            };
+            Ok(Some(out))
+        },
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use candle_nn::Conv2dConfig;
+
+    #[test]
+    fn depthwise_conv_matches_candle() -> candle_core::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        for kernel in [3usize, 7] {
+            for out_channels in [2usize, 4] {
+                let batch = 2;
+                let x = Tensor::from_iter(
+                    (0..batch * 2 * 11 * 137)
+                        .map(|i| ((i * 17 % 31) as f32 - 15.0) / 19.0),
+                    &device,
+                )?
+                .reshape((batch, 2, 11, 137))?;
+                let weight = Tensor::from_iter(
+                    (0..out_channels * kernel * kernel)
+                        .map(|i| ((i * 11 % 23) as f32 - 11.0) / 29.0),
+                    &device,
+                )?
+                .reshape((out_channels, 1, kernel, kernel))?;
+                let bias = Tensor::from_iter(
+                    (0..out_channels).map(|i| i as f32 * 0.25 - 0.5),
+                    &device,
+                )?;
+                let conv = Conv2d::new(
+                    weight,
+                    Some(bias),
+                    Conv2dConfig {
+                        padding: kernel / 2,
+                        groups: 2,
+                        ..Default::default()
+                    },
+                );
+                let expected = x.apply(&conv)?.to_device(&candle_core::Device::Cpu)?;
+                let actual = depthwise_conv2d(&x, &conv)?
+                    .unwrap()
+                    .to_device(&candle_core::Device::Cpu)?;
+                let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+                let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+                let max_error = expected
+                    .iter()
+                    .zip(&actual)
+                    .map(|(expected, actual)| (expected - actual).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    max_error < 1e-4,
+                    "kernel={kernel} out_channels={out_channels} max_error={max_error}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pointwise_conv_matches_candle() -> candle_core::Result<()> {
+        let device = candle_core::Device::new_metal(0)?;
+        let (batch, input_channels, output_channels, height, width) = (2, 64, 192, 128, 128);
+        let x = Tensor::from_iter(
+            (0..batch * input_channels * height * width)
+                .map(|i| ((i * 17 % 31) as f32 - 15.0) / 19.0),
+            &device,
+        )?
+        .reshape((batch, input_channels, height, width))?;
+        let weight = Tensor::from_iter(
+            (0..output_channels * input_channels)
+                .map(|i| ((i * 11 % 23) as f32 - 11.0) / 29.0),
+            &device,
+        )?
+        .reshape((output_channels, input_channels, 1, 1))?;
+        let bias = Tensor::from_iter(
+            (0..output_channels).map(|i| i as f32 * 0.025 - 0.2),
+            &device,
+        )?;
+        let conv = Conv2d::new(weight, Some(bias), Conv2dConfig::default());
+        let expected = x.apply(&conv)?.to_device(&candle_core::Device::Cpu)?;
+        let actual = pointwise_conv2d(&x, &conv)?
+            .unwrap()
+            .to_device(&candle_core::Device::Cpu)?;
+        let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+        let actual = actual.flatten_all()?.to_vec1::<f32>()?;
+        let max_error = expected
+            .iter()
+            .zip(&actual)
+            .map(|(expected, actual)| (expected - actual).abs())
+            .fold(0f32, f32::max);
+        assert!(max_error < 1e-4, "max_error={max_error}");
+        Ok(())
+    }
 }
 
 /// Load a Metal library from pre-compiled metallib binary data.

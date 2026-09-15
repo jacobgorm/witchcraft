@@ -66,11 +66,13 @@ fn benchmark_image_embeddings(embedder: &witchcraft::Embedder, path: &Path, args
     anyhow::ensure!(counts.len() <= 2, "benchimage expects [iters] [warmup] [profile]");
     let iters = bench_count(counts.first().copied(), "WARP_BENCH_ITERS", 25)?;
     let warmup = bench_count(counts.get(1).copied(), "WARP_BENCH_WARMUP", 5)?;
+    let batch_size = bench_count(None, "WARP_BENCH_BATCH", 1)?;
     anyhow::ensure!(iters > 0, "image benchmark iterations must be greater than zero");
+    anyhow::ensure!(batch_size > 0, "image benchmark batch size must be greater than zero");
 
-    let image = witchcraft::mobileclip2::load_image(path, embedder.image_size())?
-        .to_device(embedder.device())?
-        .unsqueeze(0)?;
+    let image = witchcraft::mobileclip2::load_image(path, embedder.image_size())?;
+    let images = vec![image; batch_size];
+    let image = candle_core::Tensor::stack(&images, 0)?.to_device(embedder.device())?;
     let run = || -> Result<candle_core::Tensor> {
         let embedding = embedder.embed_image_tensor(&image)?;
         let checksum = embedding
@@ -96,13 +98,13 @@ fn benchmark_image_embeddings(embedder: &witchcraft::Embedder, path: &Path, args
     println!("device: {:?}", embedder.device().location());
     println!("image_size: {}x{}", embedder.image_size(), embedder.image_size());
     println!("embedding_shape: {:?}", run()?.dims());
-    println!("iters: {iters} warmup: {warmup}");
+    println!("batch_size: {batch_size} iters: {iters} warmup: {warmup}");
     println!(
         "model_only: median={:.2} ms mean={:.2} ms p95={:.2} ms throughput={:.2} images/s",
         times[iters / 2].as_secs_f64() * 1000.0,
         mean * 1000.0,
         times[p95].as_secs_f64() * 1000.0,
-        1.0 / mean
+        batch_size as f64 / mean
     );
 
     if profile {

@@ -381,7 +381,16 @@ fn is_supported_image_path(path: &Path) -> bool {
             .map(|extension| {
                 matches!(
                     extension.to_ascii_lowercase().as_str(),
-                    "jpg" | "jpeg" | "png" | "webp" | "bmp" | "gif" | "tif" | "tiff"
+                    "jpg"
+                        | "jpeg"
+                        | "png"
+                        | "webp"
+                        | "bmp"
+                        | "gif"
+                        | "tif"
+                        | "tiff"
+                        | "heic"
+                        | "heif"
                 )
             })
             .unwrap_or(false)
@@ -534,7 +543,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory> | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

@@ -853,12 +853,28 @@ fn load_pth_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBuild
     VarBuilder::from_pth(path, DType::F32, device)
 }
 
-pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Result<Tensor> {
+pub fn decode_image<P: AsRef<Path>>(path: P) -> candle_core::Result<image::DynamicImage> {
     let path = path.as_ref();
-    let image = image::ImageReader::open(path)
+    let is_heif = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "heic" | "heif"));
+    if is_heif {
+        let decoded = heif_oxide::decode_file(path).map_err(|error| {
+            Error::other(format!("failed to decode {}: {error}", path.display()))
+        })?;
+        let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
+            .ok_or_else(|| Error::other(format!("invalid decoded image size for {}", path.display())))?;
+        return Ok(image::DynamicImage::ImageRgba8(image));
+    }
+    image::ImageReader::open(path)
         .map_err(candle_core::Error::wrap)?
         .decode()
-        .map_err(candle_core::Error::wrap)?;
+        .map_err(candle_core::Error::wrap)
+}
+
+pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Result<Tensor> {
+    let image = decode_image(path)?;
     let image = preprocess_image(image, image_size)?;
     let data = image.into_raw();
     let tensor =

@@ -128,13 +128,28 @@ fn benchmark_image_embeddings(embedder: &witchcraft::Embedder, path: &Path, args
     Ok(())
 }
 
-fn image_paths_in_directory(directory: &Path) -> Result<Vec<PathBuf>> {
+fn collect_image_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     anyhow::ensure!(directory.is_dir(), "{} is not a directory", directory.display());
-    let mut paths = std::fs::read_dir(directory)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| super::is_supported_image_path(path))
-        .collect::<Vec<_>>();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_image_paths(&path, paths)?;
+        } else if file_type.is_file() && super::is_supported_image_path(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn image_paths_in_directories(directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for directory in directories {
+        collect_image_paths(directory, &mut paths)?;
+    }
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
@@ -151,11 +166,7 @@ fn image_contact_sheet(paths: &[PathBuf], cell_width: u16, cell_height: u16) -> 
         image::Rgba([0, 0, 0, 255]),
     );
     for (index, path) in paths.iter().take(9).enumerate() {
-        let decoded = match image::ImageReader::open(path)
-            .and_then(|reader| reader.with_guessed_format())
-            .map_err(anyhow::Error::from)
-            .and_then(|reader| reader.decode().map_err(anyhow::Error::from))
-        {
+        let decoded = match witchcraft::mobileclip2::decode_image(path).map_err(anyhow::Error::from) {
             Ok(decoded) => decoded,
             Err(error) => {
                 eprintln!("warning: could not display {}: {error}", path.display());
@@ -290,17 +301,18 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
         },
         "embedimages" => {
             anyhow::ensure!(
-                args.len() == 3 || args.len() == 4,
-                "embedimages expects [--force] <directory>"
+                args.len() >= 3,
+                "embedimages expects [--force] <directory>..."
             );
-            let (force, directory) = if args.len() == 4 {
-                anyhow::ensure!(args[2] == "--force", "expected --force before the image directory");
-                (true, &args[3])
+            let (force, directories) = if args[2] == "--force" {
+                anyhow::ensure!(args.len() >= 4, "embedimages expects a directory after --force");
+                (true, &args[3..])
             } else {
-                (false, &args[2])
+                (false, &args[2..])
             };
-            let paths = image_paths_in_directory(Path::new(directory))?;
-            anyhow::ensure!(!paths.is_empty(), "no supported images found in {}", directory);
+            let directories = directories.iter().map(PathBuf::from).collect::<Vec<_>>();
+            let paths = image_paths_in_directories(&directories)?;
+            anyhow::ensure!(!paths.is_empty(), "no supported images found under the supplied directories");
             let device = witchcraft::make_device();
             let embedder = witchcraft::Embedder::new(&device, assets)?;
             let mut db = DB::new_fast(db_name.to_path_buf())?;
@@ -379,4 +391,30 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
         _ => return Ok(false),
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_paths_in_directories;
+    use std::fs;
+
+    #[test]
+    fn collects_multiple_directories_recursively_without_duplicates() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let nested = first.join("nested");
+        let second = temporary.path().join("second");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("one.JPG"), []).unwrap();
+        fs::write(nested.join("two.heic"), []).unwrap();
+        fs::write(nested.join("ignored.txt"), []).unwrap();
+        fs::write(second.join("three.heif"), []).unwrap();
+
+        let paths = image_paths_in_directories(&[first.clone(), nested, second.clone()]).unwrap();
+        assert_eq!(
+            paths,
+            vec![first.join("one.JPG"), first.join("nested/two.heic"), second.join("three.heif")]
+        );
+    }
 }

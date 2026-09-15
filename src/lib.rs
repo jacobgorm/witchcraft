@@ -74,9 +74,13 @@ compile_error!("Must enable exactly one encoder backend: t5-quantized, modernber
 ))]
 compile_error!("Cannot enable multiple encoder backends simultaneously");
 
-// hybrid-dequant is a CPU-only optimization and cannot be used with Metal
-#[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
-compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
+// Intel MobileCLIP keeps its vision tower on Metal and its text tower on CPU.
+#[cfg(all(
+    feature = "hybrid-dequant",
+    feature = "metal",
+    not(all(feature = "mobileclip2", target_os = "macos", target_arch = "x86_64"))
+))]
+compile_error!("hybrid-dequant is incompatible with metal outside the split-device Intel MobileCLIP pipeline");
 
 #[cfg(feature = "sqlite")]
 mod db;

@@ -4,7 +4,10 @@
 //! All kernels use SM 6.2+ with native half-precision support.
 
 use anyhow::Result;
+use candle_core::{DType, Storage, Tensor};
 use candle_d3d12_kernels::{BufferBinding, Gpu, GpuBuffer, ID3D12PipelineState};
+use candle_nn::Conv2d;
+use once_cell::sync::OnceCell;
 use std::sync::Arc;
 
 fn cdiv(a: usize, b: usize) -> usize {
@@ -44,6 +47,197 @@ fn uav_f16<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
 
 fn uav_f32<'a>(buf: &'a GpuBuffer, count: u32) -> BufferBinding<'a> {
     BufferBinding::structured_f32(buf, count)
+}
+
+fn uav_f32_offset<'a>(buf: &'a GpuBuffer, offset: usize, count: usize) -> BufferBinding<'a> {
+    BufferBinding {
+        buffer: buf,
+        first_element: offset as u32,
+        num_elements: count as u32,
+        stride: 4,
+    }
+}
+
+static IMAGE_KERNELS: OnceCell<NesoD3D12Kernels> = OnceCell::new();
+
+fn image_kernels(device: &candle_core::D3D12Device) -> candle_core::Result<&'static NesoD3D12Kernels> {
+    IMAGE_KERNELS
+        .get_or_try_init(|| NesoD3D12Kernels::load(device.gpu()))
+        .map_err(candle_core::Error::wrap)
+}
+
+/// Use Neso DXIL for the contiguous fp32 convolutions that dominate FastViT.
+pub fn image_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    if let Some(output) = depthwise_conv2d(x, conv)? {
+        return Ok(Some(output));
+    }
+    pointwise_conv2d(x, conv)
+}
+
+fn depthwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    let candle_core::Device::D3D12(device) = x.device() else {
+        return Ok(None);
+    };
+    let cfg = conv.config();
+    let (batch, channels, height, width) = x.dims4()?;
+    let (out_channels, channels_per_group, kernel_h, kernel_w) = conv.weight().dims4()?;
+    if x.dtype() != DType::F32
+        || conv.weight().dtype() != DType::F32
+        || out_channels % channels != 0
+        || cfg.groups != channels
+        || channels_per_group != 1
+        || kernel_h != kernel_w
+        || !matches!(kernel_h, 3 | 7)
+        || cfg.dilation != 1
+    {
+        return Ok(None);
+    }
+    let contiguous = |tensor: &Tensor| tensor.storage_and_layout().1.is_contiguous();
+    if !contiguous(x) || !contiguous(conv.weight()) {
+        return Ok(None);
+    }
+
+    let out_height = (height + 2 * cfg.padding - kernel_h) / cfg.stride + 1;
+    let out_width = (width + 2 * cfg.padding - kernel_w) / cfg.stride + 1;
+    // Every valid output element is written by the kernel.
+    let out = unsafe {
+        Tensor::empty(
+            (batch, out_channels, out_height, out_width),
+            DType::F32,
+            x.device(),
+        )?
+    };
+    let bias = conv.bias().unwrap_or(conv.weight());
+    let (sx, lx) = x.storage_and_layout();
+    let (sw, lw) = conv.weight().storage_and_layout();
+    let (sb, lb) = bias.storage_and_layout();
+    let (so, lo) = out.storage_and_layout();
+    match (&*sx, &*sw, &*sb, &*so) {
+        (Storage::D3D12(dx), Storage::D3D12(dw), Storage::D3D12(db), Storage::D3D12(dout)) => {
+            let kernels = image_kernels(device)?;
+            let pipeline = if kernel_h == 3 {
+                &kernels.depthwise_conv2d_k3
+            } else {
+                &kernels.depthwise_conv2d_k7
+            };
+            let grid_x = cdiv(out_width, if kernel_h == 3 { 128 } else { 64 }) as u32;
+            let grid_y = (batch * out_channels * out_height) as u32;
+            let constants = [
+                batch as u32,
+                channels as u32,
+                out_channels as u32,
+                height as u32,
+                width as u32,
+                out_height as u32,
+                out_width as u32,
+                cfg.stride as u32,
+                cfg.padding as u32,
+                conv.bias().is_some() as u32,
+                grid_x,
+                grid_y,
+                1,
+            ];
+            let uavs = [
+                uav_f32_offset(dx.buffer(), lx.start_offset(), x.elem_count()),
+                uav_f32_offset(dw.buffer(), lw.start_offset(), conv.weight().elem_count()),
+                uav_f32_offset(db.buffer(), lb.start_offset(), bias.elem_count()),
+                uav_f32_offset(dout.buffer(), lo.start_offset(), out.elem_count()),
+            ];
+            kernels
+                .gpu
+                .record_dispatch(pipeline, &constants, &uavs, [grid_x, grid_y, 1])
+                .map_err(candle_core::Error::wrap)?;
+            Ok(Some(out.clone()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn pointwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Tensor>> {
+    let candle_core::Device::D3D12(device) = x.device() else {
+        return Ok(None);
+    };
+    let cfg = conv.config();
+    let (batch, input_channels, height, width) = x.dims4()?;
+    let (output_channels, channels_per_group, kernel_h, kernel_w) = conv.weight().dims4()?;
+    if x.dtype() != DType::F32
+        || conv.weight().dtype() != DType::F32
+        || channels_per_group != input_channels
+        || kernel_h != 1
+        || kernel_w != 1
+        || cfg.groups != 1
+        || cfg.stride != 1
+        || cfg.padding != 0
+        || cfg.dilation != 1
+        || input_channels % 32 != 0
+        || output_channels % 16 != 0
+        || height * width % 32 != 0
+    {
+        return Ok(None);
+    }
+    let contiguous = |tensor: &Tensor| tensor.storage_and_layout().1.is_contiguous();
+    if !contiguous(x) || !contiguous(conv.weight()) {
+        return Ok(None);
+    }
+
+    let spatial_size = height * width;
+    // The tiled kernel covers the full output for the supported dimensions.
+    let out = unsafe {
+        Tensor::empty(
+            (batch, output_channels, height, width),
+            DType::F32,
+            x.device(),
+        )?
+    };
+    let (sx, lx) = x.storage_and_layout();
+    let (sw, lw) = conv.weight().storage_and_layout();
+    let (so, lo) = out.storage_and_layout();
+    match (&*sx, &*sw, &*so) {
+        (Storage::D3D12(dx), Storage::D3D12(dw), Storage::D3D12(dout)) => {
+            let kernels = image_kernels(device)?;
+            let grid_x = cdiv(output_channels, 16) as u32;
+            let grid_y = cdiv(spatial_size, 32) as u32;
+            let constants = [
+                spatial_size as u32,
+                spatial_size as u32,
+                input_channels as u32,
+                output_channels as u32,
+                grid_x,
+                grid_y,
+                1,
+            ];
+            for batch_index in 0..batch {
+                let uavs = [
+                    uav_f32_offset(dw.buffer(), lw.start_offset(), conv.weight().elem_count()),
+                    uav_f32_offset(
+                        dx.buffer(),
+                        lx.start_offset() + batch_index * input_channels * spatial_size,
+                        input_channels * spatial_size,
+                    ),
+                    uav_f32_offset(
+                        dout.buffer(),
+                        lo.start_offset() + batch_index * output_channels * spatial_size,
+                        output_channels * spatial_size,
+                    ),
+                ];
+                kernels
+                    .gpu
+                    .record_dispatch(
+                        &kernels.pointwise_conv2d_f32,
+                        &constants,
+                        &uavs,
+                        [grid_x, grid_y, 1],
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+            }
+            let out = match conv.bias() {
+                Some(bias) => out.broadcast_add(&bias.reshape((1, output_channels, 1, 1))?)?,
+                None => out.clone(),
+            };
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
 }
 
 // ── Dispatch functions ──────────────────────────────────────────────────────

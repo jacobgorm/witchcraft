@@ -80,14 +80,17 @@ KERNEL_METADATA = {
     "depthwise_conv2d_k3_256": {
         "alias": "depthwise_conv2d_k3",
         "group": "image",
+        "d3d12": True,
     },
     "depthwise_conv2d_k7_256": {
         "alias": "depthwise_conv2d_k7",
         "group": "image",
+        "d3d12": True,
     },
     "pointwise_conv2d_f32_16x32": {
         "alias": "pointwise_conv2d_f32",
         "group": "image",
+        "d3d12": True,
     },
     "copy_f32_f16_1024": {
         "alias": "copy_f32_f16",

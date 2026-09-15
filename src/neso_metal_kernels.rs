@@ -66,7 +66,14 @@ pub fn depthwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option
     }
     let out_height = (height + 2 * cfg.padding - kernel_h) / cfg.stride + 1;
     let out_width = (width + 2 * cfg.padding - kernel_w) / cfg.stride + 1;
-    let out = Tensor::zeros((batch, out_channels, out_height, out_width), DType::F32, x.device())?;
+    // Every valid output element is written by the kernel.
+    let out = unsafe {
+        Tensor::empty(
+            (batch, out_channels, out_height, out_width),
+            DType::F32,
+            x.device(),
+        )?
+    };
     let kernels = image_kernels(device)?;
     let pipeline = match kernel_h {
         3 => &kernels.depthwise_conv2d_k3,
@@ -141,11 +148,14 @@ fn pointwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Ten
     }
 
     let spatial_size = height * width;
-    let out = Tensor::zeros(
-        (batch, output_channels, height, width),
-        DType::F32,
-        x.device(),
-    )?;
+    // The tiled kernel covers the full output for the supported dimensions.
+    let out = unsafe {
+        Tensor::empty(
+            (batch, output_channels, height, width),
+            DType::F32,
+            x.device(),
+        )?
+    };
     let (sx, lx) = x.storage_and_layout();
     let (sw, lw) = conv.weight().storage_and_layout();
     let (so, lo) = out.storage_and_layout();

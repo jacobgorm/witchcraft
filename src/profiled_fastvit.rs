@@ -11,7 +11,66 @@ fn apply_conv2d(xs: &Tensor, conv: &Conv2d) -> Result<Tensor> {
     if let Some(output) = crate::neso_metal_kernels::image_conv2d(xs, conv)? {
         return Ok(output);
     }
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    if let Some(output) = crate::neso_d3d12_kernels::image_conv2d(xs, conv)? {
+        return Ok(output);
+    }
     xs.apply(conv)
+}
+
+fn apply_sigmoid(xs: &Tensor) -> Result<Tensor> {
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    if matches!(xs.device(), Device::D3D12(_)) {
+        return (xs.neg()?.exp()? + 1.)?.recip();
+    }
+    sigmoid(xs)
+}
+
+fn attention_qk(
+    q: &Tensor,
+    k: &Tensor,
+    batch: usize,
+    heads: usize,
+    tokens: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    if matches!(q.device(), Device::D3D12(_)) {
+        let q = q.contiguous()?.reshape((batch * heads, tokens, head_dim))?;
+        let k = k
+            .contiguous()?
+            .reshape((batch * heads, tokens, head_dim))?
+            .transpose(1, 2)?;
+        return q.matmul(&k)?.reshape((batch, heads, tokens, tokens));
+    }
+    #[cfg(not(all(feature = "neso-d3d12", target_os = "windows")))]
+    let _ = (batch, heads, tokens, head_dim);
+    q.matmul(&k.transpose(D::Minus2, D::Minus1)?)
+}
+
+fn attention_av(
+    attention: &Tensor,
+    values: &Tensor,
+    batch: usize,
+    heads: usize,
+    tokens: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    if matches!(attention.device(), Device::D3D12(_)) {
+        let attention = attention
+            .contiguous()?
+            .reshape((batch * heads, tokens, tokens))?;
+        let values = values
+            .contiguous()?
+            .reshape((batch * heads, tokens, head_dim))?;
+        return attention
+            .matmul(&values)?
+            .reshape((batch, heads, tokens, head_dim));
+    }
+    #[cfg(not(all(feature = "neso-d3d12", target_os = "windows")))]
+    let _ = (batch, heads, tokens, head_dim);
+    attention.matmul(values)
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +171,10 @@ impl SqueezeExcitation {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let residual = xs;
         let xs = xs.mean_keepdim(D::Minus2)?.mean_keepdim(D::Minus1)?;
-        let xs = sigmoid(&apply_conv2d(&apply_conv2d(&xs, &self.fc1)?.relu()?, &self.fc2)?)?;
+        let xs = apply_sigmoid(&apply_conv2d(
+            &apply_conv2d(&xs, &self.fc1)?.relu()?,
+            &self.fc2,
+        )?)?;
         residual.broadcast_mul(&xs)
     }
 }
@@ -389,12 +451,13 @@ impl Attention {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (qkv, b, c, h, w) = self.qkv(xs)?;
+        let n = h * w;
         let q = (qkv.get(0)? * self.scale)?;
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
-        let att = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?;
+        let att = attention_qk(&q, &k, b, self.num_heads, n, self.head_dim)?;
         let att = softmax(&att, D::Minus1)?;
-        let xs = att.matmul(&v)?;
+        let xs = attention_av(&att, &v, b, self.num_heads, n, self.head_dim)?;
         let xs = xs.transpose(1, 2)?.reshape((b, h * w, c))?;
         let xs = xs.apply(&self.proj)?;
         xs.transpose(D::Minus1, D::Minus2)?.reshape((b, c, h, w))
@@ -422,12 +485,14 @@ impl Attention {
         let k = qkv.get(1)?;
         let v = qkv.get(2)?;
         let att = profile.time(device, format!("{label}.qk_matmul"), || {
-            q.matmul(&k.transpose(D::Minus2, D::Minus1)?)
+            attention_qk(&q, &k, b, self.num_heads, n, self.head_dim)
         })?;
         let att = profile.time(device, format!("{label}.softmax"), || {
             softmax(&att, D::Minus1)
         })?;
-        let xs = profile.time(device, format!("{label}.av_matmul"), || att.matmul(&v))?;
+        let xs = profile.time(device, format!("{label}.av_matmul"), || {
+            attention_av(&att, &v, b, self.num_heads, n, self.head_dim)
+        })?;
         let xs = xs.transpose(1, 2)?.reshape((b, h * w, c))?;
         let xs = profile.time(device, format!("{label}.proj"), || xs.apply(&self.proj))?;
         profile.time(device, format!("{label}.reshape_out"), || {

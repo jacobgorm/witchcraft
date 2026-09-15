@@ -403,6 +403,7 @@ fn select_gated_tokens(
 pub struct XtrImageEncoder {
     vision_model: ProfiledFastVit,
     adapter: XtrImageAdapter,
+    adapter_device: Device,
     image_size: usize,
     device: Device,
 }
@@ -418,6 +419,20 @@ impl XtrImageEncoder {
             config.embed_dim,
             mobileclip_vb.pp("visual.trunk"),
         )?;
+        #[cfg(any(
+            all(feature = "neso-d3d12", target_os = "windows"),
+            all(feature = "neso-metal", target_os = "macos", target_arch = "x86_64")
+        ))]
+        let adapter_device = if matches!(device, Device::D3D12(_) | Device::Metal(_)) {
+            Device::Cpu
+        } else {
+            device.clone()
+        };
+        #[cfg(not(any(
+            all(feature = "neso-d3d12", target_os = "windows"),
+            all(feature = "neso-metal", target_os = "macos", target_arch = "x86_64")
+        )))]
+        let adapter_device = device.clone();
 
         #[cfg(feature = "modernbert")]
         let (
@@ -459,7 +474,11 @@ impl XtrImageEncoder {
             let has_output_scale = tensors.names().contains(&"output_scale");
             let has_output_bias = tensors.names().contains(&"output_bias");
             let adapter_vb =
-                VarBuilder::from_buffered_safetensors(adapter_bytes.to_vec(), DType::F32, device)?;
+                VarBuilder::from_buffered_safetensors(
+                    adapter_bytes.to_vec(),
+                    DType::F32,
+                    &adapter_device,
+                )?;
             (
                 adapter_vb,
                 adapter_type.to_string(),
@@ -482,7 +501,7 @@ impl XtrImageEncoder {
             let adapter_bytes = QUANTIZED_XTR_ADAPTER
                 .bytes(assets)
                 .map_err(|_| Error::other("failed to read mobileclip2-xtr.gguf"))?;
-            let (adapter_vb, metadata) = load_gguf_weights(adapter_bytes, device)?;
+            let (adapter_vb, metadata) = load_gguf_weights(adapter_bytes, &adapter_device)?;
             let adapter_type = gguf_string(&metadata, "adapter_type").unwrap_or_else(|| {
                 if adapter_vb.contains_tensor("base.net.0.weight") {
                     "residual_mlp"
@@ -521,6 +540,7 @@ impl XtrImageEncoder {
         Ok(Self {
             vision_model,
             adapter,
+            adapter_device,
             image_size: XTR_IMAGE_SIZE,
             device: device.clone(),
         })
@@ -529,16 +549,21 @@ impl XtrImageEncoder {
     /// Return normalized-ready 96d patch vectors for a 512x512 image.
     /// Gated assets keep the token count recorded in their metadata.
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
-        self.adapter
-            .forward(&self.vision_model.forward_patches(pixel_values)?)
+        let patches = self
+            .vision_model
+            .forward_patches(pixel_values)?
+            .to_device(&self.adapter_device)?;
+        self.adapter.forward(&patches)
     }
 
     pub fn forward_profiled(&self, pixel_values: &Tensor) -> Result<(Tensor, ImageProfile)> {
         let (patches, mut profile) = self.vision_model.forward_patches_profiled(pixel_values)?;
         self.device.synchronize()?;
         let started = std::time::Instant::now();
-        let output = self.adapter.forward(&patches)?;
-        self.device.synchronize()?;
+        let output = self
+            .adapter
+            .forward(&patches.to_device(&self.adapter_device)?)?;
+        self.adapter_device.synchronize()?;
         profile.record("xtr_adapter", started.elapsed(), output.dims().to_vec());
         Ok((output, profile))
     }
@@ -719,8 +744,15 @@ fn load_gguf_weights(
     let names = content.tensor_infos.keys().cloned().collect::<Vec<_>>();
     let mut tensors = std::collections::HashMap::with_capacity(names.len());
     for name in names {
+        // GGUF quantized storage is not implemented for D3D12. Decode on the
+        // CPU once at model load, then upload the dequantized fp32 tensor.
+        let quantized_device = if matches!(device, Device::D3D12(_)) {
+            &Device::Cpu
+        } else {
+            device
+        };
         let tensor = content
-            .tensor(&mut cursor, &name, device)?
+            .tensor(&mut cursor, &name, quantized_device)?
             .dequantize(device)?;
         tensors.insert(name, tensor);
     }

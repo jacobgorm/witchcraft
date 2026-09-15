@@ -93,12 +93,35 @@ impl Embedder {
     pub fn new(device: &Device, assets: &std::path::Path) -> Result<Self> {
         let (builder, tokenizer) = t5_encoder::T5ModelBuilder::load(assets)?;
         let query_tokenizer = tokenizer_for_queries(&tokenizer);
-        let model = builder.build_encoder(device, assets)?;
+        #[cfg(all(
+            feature = "mobileclip2",
+            feature = "neso-metal",
+            target_os = "macos",
+            target_arch = "x86_64"
+        ))]
+        let text_device = Device::Cpu;
+        #[cfg(not(all(
+            feature = "mobileclip2",
+            feature = "neso-metal",
+            target_os = "macos",
+            target_arch = "x86_64"
+        )))]
+        let text_device = device.clone();
+        let model = builder.build_encoder(&text_device, assets)?;
         #[cfg(all(
             feature = "mobileclip2",
             any(feature = "modernbert", feature = "modernbert-quantized")
         ))]
-        let image_model = crate::mobileclip2::XtrImageEncoder::load(device, assets)?;
+        let image_model = {
+            #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+            let image_device = Device::new_d3d12(0).unwrap_or_else(|err| {
+                log::warn!("unable to create D3D12 image device: {err}; using {device:?}");
+                device.clone()
+            });
+            #[cfg(not(all(feature = "neso-d3d12", target_os = "windows")))]
+            let image_device = device.clone();
+            crate::mobileclip2::XtrImageEncoder::load(&image_device, assets)?
+        };
         Ok(Self {
             tokenizer,
             query_tokenizer,
@@ -165,8 +188,8 @@ impl Embedder {
     #[cfg(feature = "mobileclip2")]
     pub fn embed_image_tensor(&self, image: &Tensor) -> Result<Tensor> {
         let image = match image.dims().len() {
-            3 => image.to_device(self.model.device())?.unsqueeze(0)?,
-            4 => image.to_device(self.model.device())?,
+            3 => image.to_device(self.device())?.unsqueeze(0)?,
+            4 => image.to_device(self.device())?,
             rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
         };
         #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
@@ -182,8 +205,8 @@ impl Embedder {
         image: &Tensor,
     ) -> Result<(Tensor, crate::mobileclip2::ImageProfile)> {
         let image = match image.dims().len() {
-            3 => image.to_device(self.model.device())?.unsqueeze(0)?,
-            4 => image.to_device(self.model.device())?,
+            3 => image.to_device(self.device())?.unsqueeze(0)?,
+            4 => image.to_device(self.device())?,
             rank => anyhow::bail!("expected CHW or NCHW image tensor, got rank {rank}"),
         };
         #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
@@ -193,10 +216,10 @@ impl Embedder {
             let (embeddings, profile) = self.model.forward_image_profiled(&image)?;
             (embeddings.unsqueeze(1)?, profile)
         };
-        self.model.device().synchronize()?;
+        self.device().synchronize()?;
         let started = std::time::Instant::now();
         let normalized = normalize_l2(&embeddings)?;
-        self.model.device().synchronize()?;
+        self.device().synchronize()?;
         profile.record("normalize_l2", started.elapsed(), normalized.dims().to_vec());
         Ok((normalized, profile))
     }

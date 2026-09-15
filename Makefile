@@ -29,7 +29,7 @@ ifeq ($(UNAME_S),Darwin)
     TARGET := aarch64-apple-darwin
   else
     # Intel Mac: Neso-generated Metal kernels (scalar Metal 2.4 fallback)
-    CLI_FEATURES := $(ENCODER),neso-metal,progress,sqlite
+    CLI_FEATURES := $(ENCODER),neso-metal,fbgemm,hybrid-dequant,progress,sqlite
     MOBILECLIP2_CLI_FEATURES := mobileclip2,neso-metal,progress,sqlite
     CAPI_FEATURES := $(ENCODER),neso-metal,capi-embed-cache
     NAPI_FEATURES := $(ENCODER),neso-metal,napi
@@ -246,7 +246,7 @@ pickbrain-install: pickbrain
 	~/bin/pickbrain --register
 
 macintel: prereqs neso-kernels-metal-nosimd download
-	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,progress,sqlite
+	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features $(ENCODER),neso-metal,fbgemm,hybrid-dequant,progress,sqlite
 
 winintel: prereqs neso-kernels-hlsl download
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features $(ENCODER),neso-d3d12,progress,sqlite

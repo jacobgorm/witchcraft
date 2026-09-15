@@ -111,7 +111,7 @@ embed-assets = []
 progress = ["dep:indicatif"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
 neso-metal = ["metal", "dep:dispatch2", "dep:objc2-metal", "dep:tar", "dep:zstd"]
-neso-d3d12 = ["dep:candle-d3d12-kernels", "dep:tar", "dep:zstd"]
+neso-d3d12 = ["dep:candle-d3d12-kernels", "candle-core/d3d12", "dep:tar", "dep:zstd"]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
@@ -123,3 +123,9 @@ sqlite = ["dep:rusqlite"]
 version = "0.39.0"
 features = ["bundled"]
 optional = true
+
+# The pinned Candle revision's D3D12 backend still uses the complete kernel
+# API from this earlier revision. Keep that small backend crate in-tree so
+# enabling candle-core/d3d12 builds reproducibly on Windows.
+[patch."https://github.com/jacobgorm/candle"]
+candle-d3d12-kernels = { path = "third_party/candle-d3d12-kernels" }

@@ -416,7 +416,7 @@ mod tests {
         let paths = image_paths_in_directories(&[first.clone(), nested, second.clone()]).unwrap();
         assert_eq!(
             paths,
-            vec![first.join("one.JPG"), first.join("nested/two.heic"), second.join("three.heif")]
+            vec![first.join("nested/two.heic"), first.join("one.JPG"), second.join("three.heif")]
         );
     }
 }

@@ -47,7 +47,7 @@ const DEFAULT_EMBED_DIM: usize = 512;
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
 const XTR_IMAGE_SIZE: usize = 512;
 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
-const GATED_XTR_IMAGE_TOKENS: usize = 128;
+const GATED_XTR_IMAGE_TOKENS: usize = 64;
 const DEFAULT_TEXT_WIDTH: usize = 512;
 const DEFAULT_TEXT_HEADS: usize = 8;
 const DEFAULT_TEXT_LAYERS: usize = 12;

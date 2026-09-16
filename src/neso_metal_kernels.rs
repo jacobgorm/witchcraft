@@ -89,27 +89,27 @@ pub fn depthwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option
         (Storage::Metal(mx), Storage::Metal(mw), Storage::Metal(mb), Storage::Metal(mo)) => {
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(mx.buffer()), lx.start_offset() * 4);
-            encoder.set_buffer(1, Some(mw.buffer()), lw.start_offset() * 4);
-            encoder.set_buffer(2, Some(mb.buffer()), lb.start_offset() * 4);
-            encoder.set_buffer(3, Some(mo.buffer()), lo.start_offset() * 4);
-            encoder.set_bytes(4, &(batch as i32));
-            encoder.set_bytes(5, &(channels as i32));
-            encoder.set_bytes(6, &(out_channels as i32));
-            encoder.set_bytes(7, &(height as i32));
-            encoder.set_bytes(8, &(width as i32));
-            encoder.set_bytes(9, &(out_height as i32));
-            encoder.set_bytes(10, &(out_width as i32));
-            encoder.set_bytes(11, &(cfg.stride as i32));
-            encoder.set_bytes(12, &(cfg.padding as i32));
-            encoder.set_bytes(13, &(conv.bias().is_some() as i32));
+            encoder.as_ref().set_input_buffer(0, Some(mx.buffer()), lx.start_offset() * 4);
+            encoder.as_ref().set_input_buffer(1, Some(mw.buffer()), lw.start_offset() * 4);
+            encoder.as_ref().set_input_buffer(2, Some(mb.buffer()), lb.start_offset() * 4);
+            encoder.as_ref().set_output_buffer(3, Some(mo.buffer()), lo.start_offset() * 4);
+            encoder.as_ref().set_bytes(4, &(batch as i32));
+            encoder.as_ref().set_bytes(5, &(channels as i32));
+            encoder.as_ref().set_bytes(6, &(out_channels as i32));
+            encoder.as_ref().set_bytes(7, &(height as i32));
+            encoder.as_ref().set_bytes(8, &(width as i32));
+            encoder.as_ref().set_bytes(9, &(out_height as i32));
+            encoder.as_ref().set_bytes(10, &(out_width as i32));
+            encoder.as_ref().set_bytes(11, &(cfg.stride as i32));
+            encoder.as_ref().set_bytes(12, &(cfg.padding as i32));
+            encoder.as_ref().set_bytes(13, &(conv.bias().is_some() as i32));
             let threads = if kernel_h == 3 { 128 } else { 64 };
             let grid = MTLSize {
                 width: cdiv(out_width, threads),
                 height: batch * out_channels * out_height,
                 depth: 1,
             };
-            encoder.dispatch_thread_groups(grid, tg_size(pipeline, threads));
+            encoder.as_ref().dispatch_thread_groups(grid, tg_size(pipeline, threads));
             Ok(Some(out.clone()))
         },
         _ => Ok(None),
@@ -164,28 +164,28 @@ fn pointwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Ten
             let pipeline = &image_kernels(device)?.pointwise_conv2d_f32;
             let encoder = device.command_encoder()?;
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(mw.buffer()), lw.start_offset() * 4);
-            encoder.set_bytes(3, &(spatial_size as i32));
-            encoder.set_bytes(4, &(spatial_size as i32));
-            encoder.set_bytes(5, &(input_channels as i32));
-            encoder.set_bytes(6, &(output_channels as i32));
+            encoder.as_ref().set_input_buffer(0, Some(mw.buffer()), lw.start_offset() * 4);
+            encoder.as_ref().set_bytes(3, &(spatial_size as i32));
+            encoder.as_ref().set_bytes(4, &(spatial_size as i32));
+            encoder.as_ref().set_bytes(5, &(input_channels as i32));
+            encoder.as_ref().set_bytes(6, &(output_channels as i32));
             let grid = MTLSize {
                 width: cdiv(output_channels, 16),
                 height: cdiv(spatial_size, 32),
                 depth: 1,
             };
             for batch_index in 0..batch {
-                encoder.set_buffer(
+                encoder.as_ref().set_input_buffer(
                     1,
                     Some(mx.buffer()),
                     (lx.start_offset() + batch_index * input_channels * spatial_size) * 4,
                 );
-                encoder.set_buffer(
+                encoder.as_ref().set_output_buffer(
                     2,
                     Some(mo.buffer()),
                     (lo.start_offset() + batch_index * output_channels * spatial_size) * 4,
                 );
-                encoder.dispatch_thread_groups(grid, tg_size(pipeline, 256));
+                encoder.as_ref().dispatch_thread_groups(grid, tg_size(pipeline, 256));
             }
             // Finish recording the custom kernel before Candle records the bias add.
             drop(encoder);

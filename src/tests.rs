@@ -342,6 +342,51 @@ mod tests {
     }
 
     #[test]
+    fn test_coherent_image_vectors_receive_hub_penalty() -> anyhow::Result<()> {
+        let query = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &Device::Cpu)?;
+        let embeddings = Tensor::from_vec(
+            vec![
+                0.50f32, 0.0, // text vector
+                0.35, 0.936_749_7, // identical unit image vectors have centroid norm 1.0
+                0.35, 0.936_749_7,
+            ],
+            (3, 2),
+            &Device::Cpu,
+        )?;
+        let image_embeddings = embeddings.narrow(0, 1, 2)?;
+        let image_ptrs = crate::docptrs_for_embeddings(2, "i2", &image_embeddings)?;
+        let unindexed = vec![(
+            vec![(1, 0), image_ptrs[0], image_ptrs[1]],
+            embeddings,
+        )];
+
+        let results = crate::match_centroids_raw(
+            &[],
+            &query,
+            None,
+            &unindexed,
+            f32::NEG_INFINITY,
+            10,
+        )?;
+
+        assert_eq!((results[0].1, results[0].2), (1, 0));
+        assert!((results[0].0 - 0.50).abs() < 1e-6);
+        assert!((results[1].0 - 0.46).abs() < 1e-3);
+
+        let uncalibrated = crate::match_centroids_raw_with_image_score_boost(
+            &[],
+            &query,
+            None,
+            &unindexed,
+            f32::NEG_INFINITY,
+            10,
+            0.0,
+        )?;
+        assert!((uncalibrated[1].0 - 0.35).abs() < 1e-6);
+        Ok(())
+    }
+
+    #[test]
     fn test_incremental_index() -> std::io::Result<()> {
         let dir = tempdir().unwrap();
         let path: PathBuf = dir.path().join("warp");

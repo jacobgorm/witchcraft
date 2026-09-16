@@ -4,7 +4,7 @@ use crate::progress_reporter::ProgressReporter;
 use crate::sql_generator::build_filter_sql_and_params;
 use crate::{
     clear_generations_cache, compute_cached_embeddings_many, dim_from_model_id,
-    docptrs_for_counts, document_cache_hash, embed_query_for_search,
+    docptrs_for_embeddings, document_cache_hash, embed_query_for_search,
     embedding_counts_match_chunk_count, hybrid_reciprocal_rank_fusion,
     index_buffered_embeddings_with_options, load_cached_embeddings,
     load_or_compute_cached_embeddings, match_centroids_raw,
@@ -225,18 +225,18 @@ pub fn exact_match_centroids_bulk(
         let Some(cached) = cache.get_for_document(rowid_u64, hash.as_deref().unwrap_or(""))? else {
             continue;
         };
-        let docptrs = docptrs_for_counts(rowid_u32, &cached.counts);
+        let embeddings = Tensor::embeddings_from_packed(
+            &cached.embeddings,
+            dim_from_model_id(&cached.model),
+            &Device::Cpu,
+        )?;
+        let docptrs = docptrs_for_embeddings(rowid_u32, &cached.counts, &embeddings)?;
         anyhow::ensure!(
             docptrs.len() == cached.embedding_count,
             "rowid {rowid} has {} docptrs but {} embeddings",
             docptrs.len(),
             cached.embedding_count
         );
-        let embeddings = Tensor::embeddings_from_packed(
-            &cached.embeddings,
-            dim_from_model_id(&cached.model),
-            &Device::Cpu,
-        )?;
         rows += cached.embedding_count;
         ptrs.extend(docptrs);
         tensors.push(embeddings);
@@ -696,7 +696,7 @@ fn append_unindexed_embedding(
         &Device::Cpu,
     )?;
     let rowid: u32 = record.rowid.try_into()?;
-    let ptrs = docptrs_for_counts(rowid, &cached.counts);
+    let ptrs = docptrs_for_embeddings(rowid, &cached.counts, &embeddings)?;
     anyhow::ensure!(
         ptrs.len() == cached.embedding_count,
         "rowid {} has {} embedding rows but {} document indices",

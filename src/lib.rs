@@ -224,6 +224,16 @@ pub type DocPtr = (u32, u32);
 // Persist image modality in the otherwise-unused high bit of the indexed
 // sub-chunk key. Public search results always have the bit removed.
 const IMAGE_VECTOR_SUB_IDX_FLAG: u32 = 1 << 31;
+// Seven bits carry a quantized per-image hubness penalty. Keeping this in the
+// indexed document pointer makes the correction available in both indexed and
+// buffered searches without changing the embedding cache format.
+const IMAGE_HUB_PENALTY_SHIFT: u32 = 24;
+const IMAGE_HUB_PENALTY_MASK: u32 = 0x7f << IMAGE_HUB_PENALTY_SHIFT;
+const SUB_IDX_MASK: u32 = !(IMAGE_VECTOR_SUB_IDX_FLAG | IMAGE_HUB_PENALTY_MASK);
+const IMAGE_HUB_PENALTY_SCALE: f32 = 1024.0;
+const IMAGE_HUB_CENTROID_FLOOR: f32 = 0.55;
+const IMAGE_HUB_CENTROID_WEIGHT: f32 = 0.4;
+const IMAGE_HUB_MAX_PENALTY: f32 = 0.1;
 const IMAGE_VECTOR_SCORE_BOOST: f32 = 0.21;
 
 #[derive(Clone, Copy, Debug)]
@@ -2953,9 +2963,7 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
         &sim[start..start + n]
     };
 
-    all.sort_unstable_by_key(|&((rowid, sub_idx), _)| {
-        (rowid, sub_idx & !IMAGE_VECTOR_SUB_IDX_FLAG)
-    });
+    all.sort_unstable_by_key(|&((rowid, sub_idx), _)| (rowid, sub_idx & SUB_IDX_MASK));
 
     let mut sub_scores = vec![0.0f32; n];
     sub_scores.copy_from_slice(&missing_similarities);
@@ -2977,7 +2985,10 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
             all[i]
         };
         let is_image_vector = encoded_sub_idx & IMAGE_VECTOR_SUB_IDX_FLAG != 0;
-        let sub_idx = encoded_sub_idx & !IMAGE_VECTOR_SUB_IDX_FLAG;
+        let image_hub_penalty = ((encoded_sub_idx & IMAGE_HUB_PENALTY_MASK)
+            >> IMAGE_HUB_PENALTY_SHIFT) as f32
+            / IMAGE_HUB_PENALTY_SCALE;
+        let sub_idx = encoded_sub_idx & SUB_IDX_MASK;
 
         if i > 0 {
             let idx_change = prev_idx != idx;
@@ -3009,7 +3020,18 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
 
         let row = row_at(pos);
         if is_image_vector {
-            vmax_with_offset_inplace(&mut sub_scores, row, image_vector_score_boost);
+            // A zero boost is the explicit uncalibrated path used by image
+            // queries; do not apply text-to-image hubness calibration there.
+            let offset = if image_vector_score_boost == 0.0 {
+                0.0
+            } else {
+                image_vector_score_boost - image_hub_penalty
+            };
+            vmax_with_offset_inplace(
+                &mut sub_scores,
+                row,
+                offset,
+            );
         } else {
             vmax_inplace(&mut sub_scores, row);
         }
@@ -3045,8 +3067,20 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
+    docptrs_for_counts_with_image_penalty(id, counts, 0.0)
+}
+
+fn docptrs_for_counts_with_image_penalty(
+    id: u32,
+    counts: &str,
+    image_hub_penalty: f32,
+) -> Vec<DocPtr> {
     let mut document_indices = Vec::new();
+    let penalty_code = (image_hub_penalty.clamp(0.0, IMAGE_HUB_MAX_PENALTY)
+        * IMAGE_HUB_PENALTY_SCALE)
+        .round() as u32;
     for (i, encoded_count) in counts.split(',').enumerate() {
         let (is_image, count) = match encoded_count.strip_prefix('i') {
             Some(count) => (true, count),
@@ -3057,13 +3091,37 @@ pub(crate) fn docptrs_for_counts(id: u32, counts: &str) -> Vec<DocPtr> {
         };
         let mut sub_idx = i as u32;
         if is_image {
-            sub_idx |= IMAGE_VECTOR_SUB_IDX_FLAG;
+            sub_idx |= IMAGE_VECTOR_SUB_IDX_FLAG
+                | (penalty_code << IMAGE_HUB_PENALTY_SHIFT);
         }
         for _ in 0..count {
             document_indices.push((id, sub_idx));
         }
     }
     document_indices
+}
+
+pub(crate) fn docptrs_for_embeddings(
+    id: u32,
+    counts: &str,
+    embeddings: &Tensor,
+) -> Result<Vec<DocPtr>> {
+    let image_rows = counts
+        .split(',')
+        .next()
+        .and_then(|count| count.strip_prefix('i'))
+        .and_then(|count| count.parse::<usize>().ok());
+    let penalty = if let Some(image_rows) = image_rows {
+        anyhow::ensure!(image_rows <= embeddings.dim(0)?, "image row count exceeds embedding rows");
+        let centroid = embeddings.narrow(0, 0, image_rows)?.mean(0)?;
+        let centroid_norm = centroid.sqr()?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+        ((centroid_norm - IMAGE_HUB_CENTROID_FLOOR).max(0.0)
+            * IMAGE_HUB_CENTROID_WEIGHT)
+            .min(IMAGE_HUB_MAX_PENALTY)
+    } else {
+        0.0
+    };
+    Ok(docptrs_for_counts_with_image_penalty(id, counts, penalty))
 }
 
 pub(crate) fn embedding_counts_match_chunk_count(counts: &str, chunk_count: usize) -> bool {
@@ -4042,7 +4100,7 @@ fn write_buckets_for_rowids(
                 let t = Tensor::embeddings_from_packed(&embeddings.embeddings, dim, &Device::Cpu)?;
                 let (m, _) = t.dims2()?;
 
-                let docptrs = docptrs_for_counts(id, &embeddings.counts);
+                let docptrs = docptrs_for_embeddings(id, &embeddings.counts, &t)?;
                 anyhow::ensure!(
                     docptrs.len() == m,
                     "document {id} has {m} embedding rows but {} document indices",

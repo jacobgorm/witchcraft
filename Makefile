@@ -157,12 +157,16 @@ modernbert-assets: assets/modernbert-config.json assets/modernbert-tokenizer.jso
 
 modernbert-quantized-assets: assets/modernbert-config.json assets/modernbert-tokenizer.json assets/modernbert.gguf assets/LICENSE assets/LICENSE.granite assets/NOTICE assets/SHA256SUMS
 
-mobileclip2-assets: env/bin/transformers | assets
-	@if [ ! -f assets/mobileclip2-config.json ] || [ ! -f assets/mobileclip2-tokenizer.json ] || [ ! -f assets/mobileclip2.safetensors ]; then \
+mobileclip2-stock-assets: env/bin/transformers | assets
+	@if [ ! -f assets/mobileclip2-config.json ] || [ ! -f assets/mobileclip2-tokenizer.json ] || [ ! -f assets/mobileclip2-stock.safetensors ]; then \
 		$(PYTHON_BIN) scripts/download_mobileclip2.py; \
 	fi
 
-mobileclip2-xtr-assets: mobileclip2-assets
+mobileclip2-assets: mobileclip2-stock-assets
+	@test -f assets/mobileclip2.safetensors || cp assets/mobileclip2-stock.safetensors assets/mobileclip2.safetensors
+
+mobileclip2-xtr-assets: mobileclip2-stock-assets
+	@test -f assets/mobileclip2.safetensors || (echo "missing fine-tuned assets/mobileclip2.safetensors" >&2; exit 1)
 	@test -f assets/mobileclip2-xtr.safetensors || (echo "missing assets/mobileclip2-xtr.safetensors; run scripts/export_mobileclip2_xtr.py <checkpoint> assets/mobileclip2-xtr.safetensors" >&2; exit 1)
 
 assets/mobileclip2.gguf: assets/mobileclip2.safetensors | assets prereqs

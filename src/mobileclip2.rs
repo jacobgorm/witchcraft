@@ -14,7 +14,6 @@ use candle_nn::{Linear, VarBuilder};
 use candle_transformers::models::fastvit;
 use candle_transformers::models::openclip::text_model;
 use serde::Deserialize;
-#[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
 use tokenizers::Tokenizer;
 
 #[cfg(any(
@@ -52,6 +51,8 @@ const DEFAULT_TEXT_WIDTH: usize = 512;
 const DEFAULT_TEXT_HEADS: usize = 8;
 const DEFAULT_TEXT_LAYERS: usize = 12;
 const DEFAULT_VOCAB_SIZE: usize = 49408;
+const STOCK_WEIGHTS: &str = "mobileclip2-stock.safetensors";
+const STOCK_TOKENIZER: &str = "mobileclip2-tokenizer.json";
 
 #[cfg(not(feature = "embed-assets"))]
 const CONFIG_ENV: &str = "WARP_MOBILECLIP2_CONFIG";
@@ -578,7 +579,6 @@ impl XtrImageEncoder {
 }
 
 impl T5EncoderModel {
-    #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let text_config = cfg.text_model_config();
         let text_model = text_model::OpenClipTextTransformer::new(vb.pp("text"), &text_config)?;
@@ -643,6 +643,60 @@ impl T5EncoderModel {
     pub fn image_size(&self) -> usize {
         self.image_size
     }
+}
+
+/// Unmodified MobileCLIP2 image/text model used as an exhaustive 512d baseline.
+pub struct StockMobileClip2 {
+    tokenizer: Tokenizer,
+    model: T5EncoderModel,
+}
+
+impl StockMobileClip2 {
+    pub fn load(device: &Device, assets: &Path) -> Result<Self> {
+        let config = load_config(assets)?;
+        let tokenizer_path = assets.join(STOCK_TOKENIZER);
+        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
+            Error::other(format!(
+                "failed to load stock MobileCLIP2 tokenizer {}: {error}",
+                tokenizer_path.display()
+            ))
+        })?;
+        let weights_path = assets.join(STOCK_WEIGHTS);
+        if !weights_path.is_file() {
+            return Err(Error::other(format!(
+                "missing stock MobileCLIP2 weights {}; run `make mobileclip2-stock-assets`",
+                weights_path.display()
+            ))
+            .into());
+        }
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, device)?
+        };
+        let model = T5EncoderModel::load(vb, &config)?;
+        Ok(Self { tokenizer, model })
+    }
+
+    pub fn embed_text(&self, text: &str) -> Result<Tensor> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|error| Error::other(format!("tokenize MobileCLIP2 query: {error}")))?;
+        let input = Tensor::new(encoding.get_ids(), self.model.device())?.unsqueeze(0)?;
+        normalize_rows(&self.model.forward_text_pooled(&input)?)
+    }
+
+    pub fn embed_images(&self, images: &Tensor) -> Result<Tensor> {
+        let images = images.to_device(self.model.device())?;
+        normalize_rows(&self.model.forward_image(&images)?)
+    }
+
+    pub fn image_size(&self) -> usize {
+        self.model.image_size()
+    }
+}
+
+fn normalize_rows(values: &Tensor) -> Result<Tensor> {
+    values.broadcast_div(&values.sqr()?.sum_keepdim(1)?.sqrt()?)
 }
 
 #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]

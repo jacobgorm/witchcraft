@@ -335,6 +335,45 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
                 args[0]
             );
         },
+        "clipembedimages" => {
+            anyhow::ensure!(
+                args.len() >= 4,
+                "clipembedimages expects <matrix> <directory>..."
+            );
+            let directories = args[3..].iter().map(PathBuf::from).collect::<Vec<_>>();
+            let paths = image_paths_in_directories(&directories)?;
+            anyhow::ensure!(!paths.is_empty(), "no supported images found under the supplied directories");
+            let device = witchcraft::make_device();
+            let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
+            super::mobileclip2_matrix::create(&model, &paths, Path::new(&args[2]))?;
+        },
+        "clipquery" => {
+            let display_images = args.get(2).is_some_and(|argument| argument == "-d");
+            let matrix_index = if display_images { 3 } else { 2 };
+            anyhow::ensure!(
+                args.len() > matrix_index + 1,
+                "clipquery expects [-d] <matrix> <text>..."
+            );
+            let text = args[matrix_index + 1..].join(" ");
+            let device = witchcraft::make_device();
+            let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
+            let results = super::mobileclip2_matrix::query(
+                &model,
+                Path::new(&args[matrix_index]),
+                &text,
+                10,
+            )?;
+            let image_paths = results
+                .iter()
+                .map(|(score, path)| {
+                    println!("{score:.8}: {}", path.display());
+                    path.clone()
+                })
+                .collect::<Vec<_>>();
+            if display_images {
+                display_image_grid(&image_paths);
+            }
+        },
         "image" => {
             anyhow::ensure!(args.len() == 3, "image expects an image path");
             let device = witchcraft::make_device();

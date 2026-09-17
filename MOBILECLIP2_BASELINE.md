@@ -35,3 +35,21 @@ Pass `-d` to `clipquery` to display its top images with `viu`:
 
 The raw cosine values are not calibrated to XTR scores; compare rankings and
 relevance rather than score magnitude.
+
+## Pooled-vector IVF experiment
+
+The existing matrix can also be imported into a dedicated Witchcraft IVF index.
+This stores one normalized 512d pooled MobileCLIP2 vector per image and uses
+4-bit polar residual compression. It does not modify `mydb.sqlite`.
+
+```sh
+./warp-cli clipivfbuild mobileclip2-baseline
+./warp-cli clipivfquery a man with a hat in front of two canoes
+```
+
+Pass `--force` to overwrite already imported rows. Compare IVF retrieval with
+exhaustive cosine scoring over the same cached vectors using:
+
+```sh
+./warp-cli clipivfquery --exact a man with a hat in front of two canoes
+```

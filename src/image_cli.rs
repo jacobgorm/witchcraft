@@ -374,6 +374,38 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
                 display_image_grid(&image_paths);
             }
         },
+        "clipivfbuild" => {
+            let force = args.get(2).is_some_and(|argument| argument == "--force");
+            let matrix_index = if force { 3 } else { 2 };
+            anyhow::ensure!(
+                args.len() == matrix_index + 1,
+                "clipivfbuild expects [--force] <matrix>"
+            );
+            super::mobileclip2_ivf::build(Path::new(&args[matrix_index]), force)?;
+        },
+        "clipivfquery" => {
+            let display_images = args[2..].iter().any(|argument| argument == "-d");
+            let exact = args[2..].iter().any(|argument| argument == "--exact");
+            let query_args = args[2..]
+                .iter()
+                .filter(|argument| !matches!(argument.as_str(), "-d" | "--exact"))
+                .cloned()
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                !query_args.is_empty(),
+                "clipivfquery expects [-d] [--exact] <text>..."
+            );
+            let results = super::mobileclip2_ivf::query(
+                assets,
+                &query_args.join(" "),
+                10,
+                exact,
+            )?;
+            let image_paths = print_search_results(results);
+            if display_images {
+                display_image_grid(&image_paths);
+            }
+        },
         "image" => {
             anyhow::ensure!(args.len() == 3, "image expects an image path");
             let device = witchcraft::make_device();

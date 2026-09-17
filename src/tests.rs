@@ -900,6 +900,28 @@ mod tests {
     }
 
     #[test]
+    fn packed_embeddings_support_512_dimensions() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let values = (0..(3 * 512))
+            .map(|index| ((index as f32) * 0.071).sin())
+            .collect::<Vec<_>>();
+        let embeddings = Tensor::from_vec(values, (3, 512), &Device::Cpu)?;
+        let embeddings = embeddings.broadcast_div(
+            &embeddings.sqr()?.sum_keepdim(1)?.sqrt()?,
+        )?;
+        let packed = embeddings.embeddings_to_packed()?;
+        let decoded = Tensor::embeddings_from_packed(&packed, 512, &Device::Cpu)?;
+        assert_eq!(decoded.dims2()?, (3, 512));
+        let minimum_cosine = (&embeddings * &decoded)?
+            .sum(1)?
+            .min_all()?
+            .to_scalar::<f32>()?;
+        assert!(minimum_cosine > 0.9, "minimum cosine was {minimum_cosine}");
+        Ok(())
+    }
+
+    #[test]
     fn test_hadamard_polar_quantization_layout() -> anyhow::Result<()> {
         use crate::packops::{
             TensorPackOps, POLAR2_HADAMARD_QUANT_BITS, POLAR3_HADAMARD_QUANT_BITS,

@@ -144,6 +144,38 @@ pub fn query(
     score_rows(&bytes, &query, metadata.paths, limit)
 }
 
+pub(crate) fn for_each_row<F>(prefix: &Path, mut visit: F) -> Result<usize>
+where
+    F: FnMut(PathBuf, Vec<f32>) -> Result<()>,
+{
+    let metadata_path = sidecar(prefix, ".json");
+    let matrix_path = sidecar(prefix, ".f32");
+    let metadata: MatrixMetadata = serde_json::from_reader(File::open(&metadata_path)?)?;
+    anyhow::ensure!(metadata.version == 1, "unsupported matrix version {}", metadata.version);
+    anyhow::ensure!(metadata.dimensions == DIMENSIONS, "expected a {DIMENSIONS}d matrix");
+    anyhow::ensure!(metadata.normalized, "matrix rows are not normalized");
+
+    let mut matrix = File::open(&matrix_path)?;
+    let expected = metadata.paths.len() * DIMENSIONS * std::mem::size_of::<f32>();
+    anyhow::ensure!(
+        matrix.metadata()?.len() == expected as u64,
+        "matrix has {} bytes, expected {expected} for {} rows",
+        matrix.metadata()?.len(),
+        metadata.paths.len()
+    );
+    let mut bytes = vec![0u8; DIMENSIONS * std::mem::size_of::<f32>()];
+    let count = metadata.paths.len();
+    for path in metadata.paths {
+        matrix.read_exact(&mut bytes)?;
+        let row = bytes
+            .chunks_exact(4)
+            .map(|value| f32::from_le_bytes(value.try_into().expect("four-byte float")))
+            .collect::<Vec<_>>();
+        visit(PathBuf::from(path), row)?;
+    }
+    Ok(count)
+}
+
 fn score_rows(
     bytes: &[u8],
     query: &[f32],

@@ -891,7 +891,7 @@ impl TensorPackOps for Tensor {
 
     fn embeddings_to_packed(&self) -> Result<Vec<u8>> {
         let (rows, cols) = self.dims2()?;
-        assert!(cols <= 255, "column count must fit in u8");
+        anyhow::ensure!(cols <= u16::MAX as usize, "column count must fit in u16");
         let scaled_range = (256.0 * RANGE).round() as u16;
         let range = scaled_range as f32 / 256.0;
 
@@ -924,8 +924,14 @@ impl TensorPackOps for Tensor {
             for (new_pos, &orig_col) in perm.iter().enumerate() {
                 inv_perm[orig_col] = new_pos;
             }
-            for i in &inv_perm {
-                bytes.push(*i as u8);
+            if cols <= u8::MAX as usize {
+                for i in &inv_perm {
+                    bytes.push(*i as u8);
+                }
+            } else {
+                for i in &inv_perm {
+                    bytes.extend_from_slice(&u16::try_from(*i)?.to_ne_bytes());
+                }
             }
 
             // Apply column permutation in place
@@ -1036,8 +1042,19 @@ impl TensorPackOps for Tensor {
             .step_by(MAX_WINDOW_ROWS)
             .map(|r| (r, (rows - r).min(MAX_WINDOW_ROWS)))
         {
-            let (idxs, tail) = bytes.split_at(cols);
-            let idxs: Vec<usize> = idxs.iter().map(|&i| i as usize).collect();
+            let permutation_bytes = if cols <= u8::MAX as usize {
+                cols
+            } else {
+                cols * std::mem::size_of::<u16>()
+            };
+            let (idxs, tail) = bytes.split_at(permutation_bytes);
+            let idxs: Vec<usize> = if cols <= u8::MAX as usize {
+                idxs.iter().map(|&i| i as usize).collect()
+            } else {
+                idxs.chunks_exact(2)
+                    .map(|value| u16::from_ne_bytes(value.try_into().unwrap()) as usize)
+                    .collect()
+            };
 
             let (head, tail) = tail.split_at(2);
             let symbols_count = u16::from_ne_bytes(head.try_into().unwrap()) as usize;

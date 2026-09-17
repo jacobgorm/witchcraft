@@ -1500,7 +1500,7 @@ where
 }
 
 #[cfg(feature = "mobileclip2")]
-fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
+pub fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let body = canonical_path.to_string_lossy();
     db.query(
@@ -1514,6 +1514,22 @@ fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
     .map(u64::try_from)
     .transpose()
     .map_err(Into::into)
+}
+
+/// Store already-computed image vectors in the regular SQLite embedding cache.
+#[cfg(feature = "mobileclip2")]
+pub fn cache_precomputed_image_embeddings_auto(
+    db: &mut DB,
+    path: &std::path::Path,
+    output: Tensor,
+) -> Result<(u64, usize)> {
+    let embeddings = crate::cached_image_embeddings_from_output(output)?;
+    cache_image_embeddings_auto_from_output(
+        db,
+        path,
+        embeddings,
+        &crate::image_tags::ImageTags::default(),
+    )
 }
 
 #[cfg(feature = "mobileclip2")]
@@ -1858,6 +1874,16 @@ pub fn search_embeddings(
         now.elapsed().as_millis()
     );
     Ok(results)
+}
+
+/// Exhaustively score precomputed query vectors against every cached document.
+pub fn exact_search_embeddings(
+    db: &DB,
+    query_embeddings: &Tensor,
+    top_k: usize,
+) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
+    let mut matches = exact_match_centroids_bulk(db, &[query_embeddings.clone()], top_k)?;
+    hydrate_search_results(db, &matches.pop().unwrap_or_default(), top_k)
 }
 
 fn hydrate_search_results(

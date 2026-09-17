@@ -13,6 +13,8 @@ mod histogram;
 #[cfg(feature = "mobileclip2")]
 mod mobileclip2_matrix;
 #[cfg(feature = "mobileclip2")]
+mod mobileclip2_ivf;
+#[cfg(feature = "mobileclip2")]
 #[path = "image_cli.rs"]
 mod image_cli;
 #[cfg(not(feature = "mobileclip2"))]
@@ -540,7 +542,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipembedimages <matrix> <directory>... | clipquery [-d] <matrix> <text>... | index | reindex | saliency <text> | image <path> | benchimage <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipembedimages <matrix> <directory>... | clipquery [-d] <matrix> <text>... | clipivfbuild [--force] <matrix> | clipivfquery [-d] [--exact] <text>... | index | reindex | saliency <text> | image <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

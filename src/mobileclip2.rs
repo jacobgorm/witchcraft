@@ -681,7 +681,12 @@ impl StockMobileClip2 {
             .tokenizer
             .encode(text, true)
             .map_err(|error| Error::other(format!("tokenize MobileCLIP2 query: {error}")))?;
-        let input = Tensor::new(encoding.get_ids(), self.model.device())?.unsqueeze(0)?;
+        let context_length = self.model.max_seq_len();
+        // MobileCLIP2-S0 has bidirectional text attention (`no_causal_mask`),
+        // so its EOS representation depends on the same full-context padding
+        // used by the reference OpenCLIP tokenizer.
+        let padded = padded_text_ids(encoding.get_ids(), context_length)?;
+        let input = Tensor::new(padded.as_slice(), self.model.device())?.unsqueeze(0)?;
         normalize_rows(&self.model.forward_text_pooled(&input)?)
     }
 
@@ -697,6 +702,19 @@ impl StockMobileClip2 {
 
 fn normalize_rows(values: &Tensor) -> Result<Tensor> {
     values.broadcast_div(&values.sqr()?.sum_keepdim(1)?.sqrt()?)
+}
+
+fn padded_text_ids(ids: &[u32], context_length: usize) -> Result<Vec<u32>> {
+    if ids.len() > context_length {
+        return Err(Error::other(format!(
+            "MobileCLIP2 query has {} tokens, context length is {context_length}",
+            ids.len()
+        ))
+        .into());
+    }
+    let mut padded = vec![0; context_length];
+    padded[..ids.len()].copy_from_slice(ids);
+    Ok(padded)
 }
 
 #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]
@@ -997,6 +1015,12 @@ fn preprocess_image(
 #[cfg(test)]
 mod image_preprocessing_tests {
     use super::*;
+
+    #[test]
+    fn mobileclip2_text_ids_are_zero_padded_to_full_context() {
+        let padded = padded_text_ids(&[49406, 320, 49407], 6).unwrap();
+        assert_eq!(padded, [49406, 320, 49407, 0, 0, 0]);
+    }
 
     #[test]
     fn downsampling_checkerboard_is_low_pass_filtered() -> candle_core::Result<()> {

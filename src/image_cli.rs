@@ -348,7 +348,7 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             anyhow::ensure!(args.len() == 2, "clipindex takes no arguments");
             super::mobileclip2_ivf::update_index()?;
         },
-        "clipivfquery" => {
+        "clipquery" => {
             let display_images = args[2..].iter().any(|argument| argument == "-d");
             let exact = args[2..].iter().any(|argument| argument == "--exact");
             let query_args = args[2..]
@@ -358,7 +358,7 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 !query_args.is_empty(),
-                "clipivfquery expects [-d] [--exact] <text>..."
+                "clipquery expects [-d] [--exact] <text>..."
             );
             let results = super::mobileclip2_ivf::query(
                 assets,

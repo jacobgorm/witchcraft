@@ -19,9 +19,9 @@ Register images, embed any missing pooled vectors, and update the dedicated
 ./warp-cli clipindex
 ```
 
-This stores one normalized 512d pooled MobileCLIP2 vector per image in the
-isolated `mobileclip2-ivf.sqlite` database. Bad images produce a warning and
-are skipped before rowids are allocated.
+This stores one normalized 512d pooled MobileCLIP2 vector per image as fixed-scale
+signed int8 in the isolated `mobileclip2-ivf.sqlite` database. Bad images produce
+a warning and are skipped before rowids are allocated.
 
 Query the IVF index and compare it with XTR:
 

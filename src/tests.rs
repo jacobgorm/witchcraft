@@ -941,6 +941,33 @@ mod tests {
     }
 
     #[test]
+    fn normalized_int8_embeddings_round_trip_with_unit_norm() -> anyhow::Result<()> {
+        use crate::packops::TensorPackOps;
+
+        let values = (0..(3 * 512))
+            .map(|index| ((index as f32) * 0.071).sin())
+            .collect::<Vec<_>>();
+        let embeddings = Tensor::from_vec(values, (3, 512), &Device::Cpu)?;
+        let embeddings = embeddings.broadcast_div(&embeddings.sqr()?.sum_keepdim(1)?.sqrt()?)?;
+        let packed = embeddings.embeddings_to_l2_int8_packed()?;
+        assert_eq!(packed.len(), 8 + 4 + 3 * 512);
+
+        let decoded = Tensor::embeddings_from_packed(&packed, 512, &Device::Cpu)?;
+        assert_eq!(decoded.dims2()?, (3, 512));
+        let minimum_cosine = (&embeddings * &decoded)?
+            .sum(1)?
+            .min_all()?
+            .to_scalar::<f32>()?;
+        assert!(minimum_cosine > 0.995, "minimum cosine was {minimum_cosine}");
+        let maximum_norm_error = (decoded.sqr()?.sum(1)?.sqrt()? - 1.0)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(maximum_norm_error < 1e-5, "maximum norm error was {maximum_norm_error}");
+        Ok(())
+    }
+
+    #[test]
     fn test_hadamard_polar_quantization_layout() -> anyhow::Result<()> {
         use crate::packops::{
             TensorPackOps, POLAR2_HADAMARD_QUANT_BITS, POLAR3_HADAMARD_QUANT_BITS,

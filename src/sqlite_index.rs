@@ -1559,6 +1559,25 @@ pub fn cache_precomputed_image_embeddings(
     output: Tensor,
 ) -> Result<usize> {
     let embeddings = crate::cached_image_embeddings_from_output(output)?;
+    cache_precomputed_embeddings(db, rowid, embeddings)
+}
+
+#[cfg(feature = "mobileclip2")]
+pub fn cache_precomputed_l2_int8_image_embeddings(
+    db: &DB,
+    rowid: u64,
+    output: Tensor,
+) -> Result<usize> {
+    let embeddings = crate::cached_l2_int8_image_embeddings_from_output(output)?;
+    cache_precomputed_embeddings(db, rowid, embeddings)
+}
+
+#[cfg(feature = "mobileclip2")]
+fn cache_precomputed_embeddings(
+    db: &DB,
+    rowid: u64,
+    embeddings: CachedEmbeddings,
+) -> Result<usize> {
     let hash = document_hash_for_rowid(db, rowid)?
         .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} is not registered"))?;
     let count = embeddings.embedding_count;

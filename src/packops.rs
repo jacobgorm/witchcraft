@@ -8,6 +8,8 @@ use super::rans64;
 const MAX_WINDOW_ROWS: usize = 1024;
 const RANS_BITS: u32 = 12;
 const RANGE: f32 = 29.0;
+const L2_INT8_MAGIC: [u8; 8] = *b"WQ8L2V01";
+const L2_INT8_SCALE: f32 = 127.0;
 const POLAR_COMPANDING_PARAM: f32 = 255.0;
 pub(crate) const POLAR2_HADAMARD_QUANT_BITS: u8 = 6;
 pub(crate) const POLAR3_HADAMARD_QUANT_BITS: u8 = 5;
@@ -865,6 +867,7 @@ pub fn scale_histogram(symbols: &[(u16, u32)], log2_scale: u32) -> Vec<(u16, u16
 
 pub trait TensorPackOps {
     fn embeddings_to_packed(&self) -> Result<Vec<u8>>;
+    fn embeddings_to_l2_int8_packed(&self) -> Result<Vec<u8>>;
     fn embeddings_from_packed(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
 
     fn to_polar_bytes(&self, bits: u8) -> Result<Vec<u8>>;
@@ -888,6 +891,25 @@ impl TensorPackOps for Tensor {
 
     See also https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
     */
+
+    fn embeddings_to_l2_int8_packed(&self) -> Result<Vec<u8>> {
+        let (rows, cols) = self.dims2()?;
+        let values = self.flatten_all()?.to_vec1::<f32>()?;
+        let mut bytes = Vec::with_capacity(L2_INT8_MAGIC.len() + 4 + values.len());
+        bytes.extend_from_slice(&L2_INT8_MAGIC);
+        bytes.extend_from_slice(&u32::try_from(rows)?.to_le_bytes());
+        for row in values.chunks_exact(cols) {
+            let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
+            anyhow::ensure!(norm.is_finite() && norm > 0.0, "cannot quantize a zero or non-finite embedding");
+            for value in row {
+                let quantized = (value / norm * L2_INT8_SCALE)
+                    .round()
+                    .clamp(-L2_INT8_SCALE, L2_INT8_SCALE) as i8;
+                bytes.push(quantized as u8);
+            }
+        }
+        Ok(bytes)
+    }
 
     fn embeddings_to_packed(&self) -> Result<Vec<u8>> {
         let (rows, cols) = self.dims2()?;
@@ -1030,6 +1052,37 @@ impl TensorPackOps for Tensor {
     }
 
     fn embeddings_from_packed(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
+        if bytes.starts_with(&L2_INT8_MAGIC) {
+            let header_len = L2_INT8_MAGIC.len() + 4;
+            anyhow::ensure!(bytes.len() >= header_len, "truncated normalized-int8 embedding header");
+            let rows = u32::from_le_bytes(
+                bytes[L2_INT8_MAGIC.len()..header_len]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let values_len = rows
+                .checked_mul(cols)
+                .ok_or_else(|| anyhow::anyhow!("normalized-int8 embedding dimensions overflow"))?;
+            anyhow::ensure!(
+                bytes.len() == header_len + values_len,
+                "normalized-int8 embedding payload has {} bytes, expected {} for {rows} rows x {cols} cols",
+                bytes.len() - header_len,
+                values_len
+            );
+            let mut values = bytes[header_len..]
+                .iter()
+                .map(|value| (*value as i8) as f32 / L2_INT8_SCALE)
+                .collect::<Vec<_>>();
+            for row in values.chunks_exact_mut(cols) {
+                let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
+                anyhow::ensure!(norm.is_finite() && norm > 0.0, "decoded normalized-int8 embedding has zero or non-finite norm");
+                for value in row {
+                    *value /= norm;
+                }
+            }
+            return Ok(Tensor::from_vec(values, (rows, cols), device)?);
+        }
+
         let (head, bytes) = bytes.split_at(2);
         let scaled_range = u16::from_ne_bytes(head.try_into().unwrap()) as f32;
         let scale = 256.0 / scaled_range;

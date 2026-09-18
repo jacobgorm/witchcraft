@@ -97,7 +97,7 @@ pub fn embed(assets: &Path) -> Result<()> {
         anyhow::ensure!(outputs.dim(0)? == valid.len(), "MobileCLIP2 batch size changed");
         for (index, (rowid, _path)) in valid.into_iter().enumerate() {
             let output = outputs.get(index)?.unsqueeze(0)?.unsqueeze(0)?;
-            witchcraft::cache_precomputed_image_embeddings(&db, rowid, output)?;
+            witchcraft::cache_precomputed_l2_int8_image_embeddings(&db, rowid, output)?;
             embedded += 1;
             progress.inc(1);
         }
@@ -113,11 +113,16 @@ pub fn embed(assets: &Path) -> Result<()> {
 pub fn update_index() -> Result<()> {
     let db = DB::new_fast(PathBuf::from(DATABASE))?;
     let pending = witchcraft::count_unindexed_embeddings(&db)?;
-    if pending == 0 {
+    let unavailable = witchcraft::semantic_index_unavailable_reason(&db)?;
+    if pending == 0 && unavailable.is_none() {
         println!("pooled MobileCLIP2 IVF index is already up to date");
         return Ok(());
     }
-    println!("adding {pending} pooled embeddings to {DATABASE}");
+    if pending > 0 {
+        println!("adding {pending} pooled embeddings to {DATABASE}");
+    } else {
+        println!("building pooled MobileCLIP2 IVF index for {DATABASE}");
+    }
     witchcraft::index_chunks_with_options(
         &db,
         None,
@@ -172,9 +177,9 @@ mod tests {
         assert!(!inserted);
         assert_eq!(missing_embeddings(&db).unwrap(), vec![(rowid, image.canonicalize().unwrap())]);
 
-        let output = Tensor::zeros((1, 1, 512), candle_core::DType::F32, &candle_core::Device::Cpu)
+        let output = Tensor::ones((1, 1, 512), candle_core::DType::F32, &candle_core::Device::Cpu)
             .unwrap();
-        witchcraft::cache_precomputed_image_embeddings(&db, rowid, output).unwrap();
+        witchcraft::cache_precomputed_l2_int8_image_embeddings(&db, rowid, output).unwrap();
         assert!(missing_embeddings(&db).unwrap().is_empty());
     }
 

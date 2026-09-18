@@ -144,7 +144,8 @@ pub use sqlite_index::{
 pub use sqlite_index::{
     cache_image_embeddings, cache_image_embeddings_auto, cache_image_embeddings_auto_many,
     cache_precomputed_image_embeddings, cache_precomputed_image_embeddings_auto,
-    cached_image_rowid, register_image_document_auto,
+    cache_precomputed_l2_int8_image_embeddings, cached_image_rowid,
+    register_image_document_auto,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
@@ -3390,16 +3391,42 @@ pub fn compute_cached_image_embeddings<P: AsRef<Path>>(
 
 #[cfg(feature = "mobileclip2")]
 pub fn cached_image_embeddings_from_output(output: Tensor) -> Result<CachedEmbeddings> {
+    cached_image_embeddings_from_output_with(output, None, |embeddings| {
+        embeddings.embeddings_to_packed()
+    })
+}
+
+#[cfg(feature = "mobileclip2")]
+pub fn cached_l2_int8_image_embeddings_from_output(output: Tensor) -> Result<CachedEmbeddings> {
+    cached_image_embeddings_from_output_with(
+        output,
+        Some(512),
+        |embeddings| embeddings.embeddings_to_l2_int8_packed(),
+    )
+}
+
+#[cfg(feature = "mobileclip2")]
+fn cached_image_embeddings_from_output_with(
+    output: Tensor,
+    expected_cols: Option<usize>,
+    pack: impl FnOnce(&Tensor) -> Result<Vec<u8>>,
+) -> Result<CachedEmbeddings> {
     let embeddings = output
         .squeeze(0)?
         .to_device(&Device::Cpu)?
         .to_dtype(DType::F32)?;
     let (rows, cols) = embeddings.dims2()?;
+    if let Some(expected_cols) = expected_cols {
+        anyhow::ensure!(
+            cols == expected_cols,
+            "pooled MobileCLIP2 embeddings must have {expected_cols} dimensions"
+        );
+    }
     Ok(CachedEmbeddings {
         model: model_id_for_dim(cols),
         counts: format!("i{rows}"),
         embedding_count: rows,
-        embeddings: embeddings.embeddings_to_packed()?,
+        embeddings: pack(&embeddings)?,
     })
 }
 

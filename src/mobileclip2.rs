@@ -698,6 +698,10 @@ impl StockMobileClip2 {
     pub fn image_size(&self) -> usize {
         self.model.image_size()
     }
+
+    pub fn device(&self) -> &Device {
+        self.model.device()
+    }
 }
 
 fn normalize_rows(values: &Tensor) -> Result<Tensor> {

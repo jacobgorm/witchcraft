@@ -112,6 +112,54 @@ fn benchmark_image_embeddings(embedder: &witchcraft::Embedder, path: &Path, args
     Ok(())
 }
 
+fn benchmark_pooled_image_embeddings(
+    model: &witchcraft::mobileclip2::StockMobileClip2,
+    path: &Path,
+    args: &[String],
+) -> Result<()> {
+    anyhow::ensure!(args.len() <= 2, "benchclipimage expects [iters] [warmup]");
+    let iters = bench_count(args.first().map(String::as_str), "WARP_BENCH_ITERS", 25)?;
+    let warmup = bench_count(args.get(1).map(String::as_str), "WARP_BENCH_WARMUP", 5)?;
+    anyhow::ensure!(iters > 0, "image benchmark iterations must be greater than zero");
+
+    let image = witchcraft::mobileclip2::load_image(path, model.image_size())?;
+    let image = image.unsqueeze(0)?.to_device(model.device())?;
+    let run = || -> Result<candle_core::Tensor> {
+        let embedding = model.embed_images(&image)?;
+        let checksum = embedding
+            .sum_all()?
+            .to_device(&candle_core::Device::Cpu)?
+            .to_scalar::<f32>()?;
+        std::hint::black_box(checksum);
+        Ok(embedding)
+    };
+    for _ in 0..warmup {
+        run()?;
+    }
+    let mut times = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let started = Instant::now();
+        run()?;
+        times.push(started.elapsed());
+    }
+    times.sort_unstable();
+    let mean = times.iter().map(Duration::as_secs_f64).sum::<f64>() / iters as f64;
+    let p95 = ((iters * 95 + 99) / 100).saturating_sub(1).min(iters - 1);
+    println!("image: {}", path.display());
+    println!("device: {:?}", model.device().location());
+    println!("image_size: {}x{}", model.image_size(), model.image_size());
+    println!("embedding_shape: {:?}", run()?.dims());
+    println!("batch_size: 1 iters: {iters} warmup: {warmup}");
+    println!(
+        "model_only: median={:.2} ms mean={:.2} ms p95={:.2} ms throughput={:.2} images/s",
+        times[iters / 2].as_secs_f64() * 1000.0,
+        mean * 1000.0,
+        times[p95].as_secs_f64() * 1000.0,
+        1.0 / mean
+    );
+    Ok(())
+}
+
 fn collect_image_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
     anyhow::ensure!(directory.is_dir(), "{} is not a directory", directory.display());
     for entry in std::fs::read_dir(directory)? {
@@ -336,6 +384,14 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             let embedder = witchcraft::Embedder::new(&device, assets)?;
             println!("model_load_ms: {:.2}", started.elapsed().as_secs_f64() * 1000.0);
             benchmark_image_embeddings(&embedder, Path::new(&args[2]), &args[3..])?;
+        },
+        "benchclipimage" => {
+            anyhow::ensure!(args.len() >= 3, "benchclipimage expects an image path");
+            let device = witchcraft::make_device();
+            let started = Instant::now();
+            let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
+            println!("model_load_ms: {:.2}", started.elapsed().as_secs_f64() * 1000.0);
+            benchmark_pooled_image_embeddings(&model, Path::new(&args[2]), &args[3..])?;
         },
         "scoreimage" => {
             anyhow::ensure!(args.len() >= 4, "scoreimage expects <path> <text>...");

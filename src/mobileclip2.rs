@@ -1,6 +1,6 @@
 //! MobileCLIP2-S0 image and text encoder using Candle.
 
-use std::io::Error;
+use std::io::{BufReader, Error, Read, Seek, SeekFrom};
 use std::path::Path;
 #[cfg(not(feature = "embed-assets"))]
 use std::path::PathBuf;
@@ -929,45 +929,86 @@ fn load_pth_path(path: PathBuf, device: &Device) -> candle_core::Result<VarBuild
     VarBuilder::from_pth(path, DType::F32, device)
 }
 
+fn is_heif_header(header: &[u8]) -> bool {
+    header.len() >= 12
+        && &header[4..8] == b"ftyp"
+        && matches!(
+        &header[8..12],
+        b"heic"
+            | b"heix"
+            | b"heim"
+            | b"heis"
+            | b"hevc"
+            | b"hevx"
+            | b"hevm"
+            | b"hevs"
+            | b"mif1"
+            | b"msf1"
+    )
+}
+
+enum ImageSource {
+    Heif,
+    Standard(image::ImageReader<BufReader<std::fs::File>>),
+}
+
+fn open_image_source(path: &Path) -> candle_core::Result<ImageSource> {
+    let mut file = std::fs::File::open(path).map_err(candle_core::Error::wrap)?;
+    let mut header = [0u8; 12];
+    let read = file.read(&mut header).map_err(candle_core::Error::wrap)?;
+    if is_heif_header(&header[..read]) {
+        return Ok(ImageSource::Heif);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(candle_core::Error::wrap)?;
+    let reader = image::ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(candle_core::Error::wrap)?;
+    if reader.format().is_none() {
+        return Err(Error::other(format!(
+            "unrecognized image header in {}",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(ImageSource::Standard(reader))
+}
+
+fn decode_heif(path: &Path) -> candle_core::Result<image::DynamicImage> {
+    let decoded = heif_oxide::decode_file(path)
+        .map_err(|error| Error::other(format!("failed to decode {}: {error}", path.display())))?;
+    let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
+        .ok_or_else(|| Error::other(format!("invalid decoded image size for {}", path.display())))?;
+    Ok(image::DynamicImage::ImageRgba8(image))
+}
+
+pub fn validate_image_header<P: AsRef<Path>>(path: P) -> candle_core::Result<()> {
+    open_image_source(path.as_ref()).map(|_| ())
+}
+
 pub fn decode_image<P: AsRef<Path>>(path: P) -> candle_core::Result<image::DynamicImage> {
     let path = path.as_ref();
-    let is_heif = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "heic" | "heif"));
-    if is_heif {
-        let decoded = heif_oxide::decode_file(path).map_err(|error| {
-            Error::other(format!("failed to decode {}: {error}", path.display()))
-        })?;
-        let image = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
-            .ok_or_else(|| Error::other(format!("invalid decoded image size for {}", path.display())))?;
-        return Ok(image::DynamicImage::ImageRgba8(image));
+    match open_image_source(path)? {
+        ImageSource::Heif => decode_heif(path),
+        ImageSource::Standard(reader) => reader.decode().map_err(candle_core::Error::wrap),
     }
-    image::ImageReader::open(path)
-        .map_err(candle_core::Error::wrap)?
-        .decode()
-        .map_err(candle_core::Error::wrap)
 }
 
 pub fn decode_image_oriented<P: AsRef<Path>>(path: P) -> candle_core::Result<image::DynamicImage> {
     use image::ImageDecoder;
 
     let path = path.as_ref();
-    let is_heif = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| matches!(extension.to_ascii_lowercase().as_str(), "heic" | "heif"));
-    if is_heif {
-        return decode_image(path);
+    match open_image_source(path)? {
+        ImageSource::Heif => decode_heif(path),
+        ImageSource::Standard(reader) => {
+            let mut decoder = reader.into_decoder().map_err(candle_core::Error::wrap)?;
+            let orientation = decoder.orientation().map_err(candle_core::Error::wrap)?;
+            let mut image =
+                image::DynamicImage::from_decoder(decoder).map_err(candle_core::Error::wrap)?;
+            image.apply_orientation(orientation);
+            Ok(image)
+        },
     }
-    let mut decoder = image::ImageReader::open(path)
-        .map_err(candle_core::Error::wrap)?
-        .into_decoder()
-        .map_err(candle_core::Error::wrap)?;
-    let orientation = decoder.orientation().map_err(candle_core::Error::wrap)?;
-    let mut image = image::DynamicImage::from_decoder(decoder).map_err(candle_core::Error::wrap)?;
-    image.apply_orientation(orientation);
-    Ok(image)
 }
 
 pub fn load_image<P: AsRef<Path>>(path: P, image_size: usize) -> candle_core::Result<Tensor> {
@@ -1054,6 +1095,24 @@ mod image_preprocessing_tests {
         let source = image::DynamicImage::ImageRgb8(image::RgbImage::new(640, 320));
         let resized = preprocess_image(source, 256)?;
         assert_eq!(resized.dimensions(), (256, 256));
+        Ok(())
+    }
+
+    #[test]
+    fn decoding_uses_file_signature_before_extension() -> candle_core::Result<()> {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+            .encode(&[255, 0, 0, 0, 0, 255], 2, 1, image::ExtendedColorType::Rgb8)
+            .map_err(candle_core::Error::wrap)?;
+        let file = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .map_err(candle_core::Error::wrap)?;
+        std::fs::write(file.path(), jpeg).map_err(candle_core::Error::wrap)?;
+
+        let decoded = decode_image_oriented(file.path())?;
+
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
         Ok(())
     }
 

@@ -1284,13 +1284,19 @@ fn image_metadata(path: &str, tags: &crate::image_tags::ImageTags) -> String {
 }
 
 #[cfg(feature = "mobileclip2")]
+fn canonical_image_path(path: &std::path::Path) -> std::path::PathBuf {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    crate::normalize_image_path(&path)
+}
+
+#[cfg(feature = "mobileclip2")]
 fn update_image_metadata(
     db: &DB,
     rowid: u64,
     path: &std::path::Path,
     tags: &crate::image_tags::ImageTags,
 ) -> Result<()> {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let path = canonical_image_path(path);
     let metadata = image_metadata(path.to_string_lossy().as_ref(), tags);
     db.query("UPDATE document SET metadata = ?1 WHERE rowid = ?2")?
         .execute((metadata, i64::try_from(rowid)?))?;
@@ -1501,7 +1507,7 @@ where
 
 #[cfg(feature = "mobileclip2")]
 pub fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>> {
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_path = canonical_image_path(path);
     let body = canonical_path.to_string_lossy();
     db.query(
         "SELECT document.rowid
@@ -1514,6 +1520,50 @@ pub fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>
     .map(u64::try_from)
     .transpose()
     .map_err(Into::into)
+}
+
+/// Register an image document without computing its embeddings. The canonical
+/// path is its stable identity, so repeated registration returns the same rowid.
+#[cfg(feature = "mobileclip2")]
+pub fn register_image_document_auto(
+    db: &mut DB,
+    path: &std::path::Path,
+) -> Result<(u64, bool)> {
+    let canonical_path = canonical_image_path(path);
+    let body = canonical_path.to_string_lossy();
+    let existing_rowid = db
+        .query("SELECT rowid FROM document WHERE body = ?1 LIMIT 1")?
+        .query_row((body.as_ref(),), |row| row.get::<_, i64>(0))
+        .optional()?;
+    if let Some(rowid) = existing_rowid {
+        return Ok((rowid.try_into()?, false));
+    }
+
+    let uuid = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("image:{}", canonical_path.display()).as_bytes(),
+    );
+    let metadata = image_metadata(body.as_ref(), &crate::image_tags::ImageTags::default());
+    db.add_doc(None, &uuid, None, &metadata, &body, None)?;
+    let rowid = db
+        .query("SELECT rowid FROM document WHERE uuid = ?1")?
+        .query_row((uuid.to_string(),), |row| row.get::<_, i64>(0))?;
+    Ok((rowid.try_into()?, true))
+}
+
+/// Cache already-computed image vectors for a registered image rowid.
+#[cfg(feature = "mobileclip2")]
+pub fn cache_precomputed_image_embeddings(
+    db: &DB,
+    rowid: u64,
+    output: Tensor,
+) -> Result<usize> {
+    let embeddings = crate::cached_image_embeddings_from_output(output)?;
+    let hash = document_hash_for_rowid(db, rowid)?
+        .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} is not registered"))?;
+    let count = embeddings.embedding_count;
+    SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
+    Ok(count)
 }
 
 /// Store already-computed image vectors in the regular SQLite embedding cache.
@@ -1571,36 +1621,11 @@ fn cache_image_embeddings_auto_from_output(
     embeddings: CachedEmbeddings,
     tags: &crate::image_tags::ImageTags,
 ) -> Result<(u64, usize)> {
-    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let body = canonical_path.to_string_lossy();
-    let existing_rowid = db
-        .query("SELECT rowid FROM document WHERE body = ?1 LIMIT 1")?
-        .query_row((body.as_ref(),), |row| row.get::<_, i64>(0))
-        .optional()?;
-    if let Some(rowid) = existing_rowid {
-        let rowid: u64 = rowid.try_into()?;
-        update_image_metadata(db, rowid, path, tags)?;
-        let hash = document_hash_for_rowid(db, rowid)?
-            .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cache hash"))?;
-        let count = embeddings.embedding_count;
-        SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
-        return Ok((rowid, count));
-    }
-
-    let uuid = uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        format!("image:{}", canonical_path.display()).as_bytes(),
-    );
-    let metadata = image_metadata(body.as_ref(), tags);
-    db.add_doc(None, &uuid, None, &metadata, &body, None)?;
-
-    let rowid: u64 = db
-        .query("SELECT rowid FROM document WHERE uuid = ?1")?
-        .query_row((uuid.to_string(),), |row| row.get::<_, i64>(0))?
-        .try_into()?;
-    let hash = document_hash_for_rowid(db, rowid)?
-        .ok_or_else(|| anyhow::anyhow!("failed to register image document rowid {rowid}"))?;
+    let (rowid, _) = register_image_document_auto(db, path)?;
+    update_image_metadata(db, rowid, path, tags)?;
     let count = embeddings.embedding_count;
+    let hash = document_hash_for_rowid(db, rowid)?
+        .ok_or_else(|| anyhow::anyhow!("image document rowid {rowid} has no cache hash"))?;
     SqliteEmbeddingCache::new(db).put(&hash, &embeddings)?;
     Ok((rowid, count))
 }
@@ -1623,6 +1648,7 @@ fn ensure_image_document(
     }
     drop(query);
 
+    let path = canonical_image_path(path);
     let body = path.to_string_lossy();
     let lens = body.chars().count().to_string();
     let hash = document_cache_hash(&body, &lens);

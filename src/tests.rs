@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::{is_year_token, query_weights_from_gate_scores, DB, EmbeddingCache};
+    use crate::{
+        is_year_token, normalize_image_path,
+        query_weights_from_gate_scores, DB, EmbeddingCache,
+    };
     use candle_core::{Device, Tensor};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -19,6 +22,22 @@ mod tests {
         assert!(is_year_token("▁2016"));
         assert!(!is_year_token("2016s"));
         assert!(!is_year_token("42"));
+    }
+
+    #[test]
+    fn image_paths_use_conventional_windows_spelling() {
+        assert_eq!(
+            normalize_image_path(std::path::Path::new(r"\\?\C:/Photos\summer/trip.jpg")),
+            PathBuf::from(r"C:\Photos\summer\trip.jpg")
+        );
+        assert_eq!(
+            normalize_image_path(std::path::Path::new(r"\\?\UNC\server/Photos\trip.jpg")),
+            PathBuf::from(r"\\server\Photos\trip.jpg")
+        );
+        assert_eq!(
+            normalize_image_path(std::path::Path::new("/Users/jacob/pics/trip.jpg")),
+            PathBuf::from("/Users/jacob/pics/trip.jpg")
+        );
     }
 
     const FACTS : [&str; 33]= [

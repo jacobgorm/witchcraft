@@ -143,7 +143,8 @@ pub use sqlite_index::{
 #[cfg(all(feature = "sqlite", feature = "mobileclip2"))]
 pub use sqlite_index::{
     cache_image_embeddings, cache_image_embeddings_auto, cache_image_embeddings_auto_many,
-    cache_precomputed_image_embeddings_auto, cached_image_rowid,
+    cache_precomputed_image_embeddings, cache_precomputed_image_embeddings_auto,
+    cached_image_rowid, register_image_document_auto,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;
@@ -384,6 +385,33 @@ fn query_weights_from_gate_scores(gate_scores: Vec<f32>, tokens: &[String]) -> V
             }
         })
         .collect()
+}
+
+/// Remove Windows verbatim-path prefixes and use one native-looking separator
+/// style for drive and UNC paths. Unix paths are left unchanged.
+pub fn normalize_image_path(path: &Path) -> PathBuf {
+    let path = path.to_string_lossy();
+    let (path, windows_path) = if let Some(path) = path
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| path.strip_prefix("//?/UNC/"))
+    {
+        (format!(r"\\{path}"), true)
+    } else if let Some(path) = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix("//?/"))
+    {
+        (path.to_owned(), true)
+    } else {
+        let windows_path = path.starts_with(r"\\")
+            || path.starts_with("//")
+            || path.as_bytes().get(1) == Some(&b':');
+        (path.into_owned(), windows_path)
+    };
+    if windows_path {
+        PathBuf::from(path.replace('/', r"\"))
+    } else {
+        PathBuf::from(path)
+    }
 }
 
 pub struct QueryEmbeddings {

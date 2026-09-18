@@ -1,26 +1,10 @@
 use super::{print_search_results, validate_semantic_search, DB};
 use anyhow::Result;
 use std::env;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-fn terminal_dimensions() -> Option<(u16, u16)> {
-    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
-    let result = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, size.as_mut_ptr()) };
-    if result != 0 {
-        return None;
-    }
-    let size = unsafe { size.assume_init() };
-    (size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
-}
-
-#[cfg(not(unix))]
-fn terminal_dimensions() -> Option<(u16, u16)> {
-    None
-}
 
 fn print_embedding(embedding: &candle_core::Tensor) -> Result<()> {
     let embedding = embedding.squeeze(0)?.to_device(&candle_core::Device::Cpu)?;
@@ -153,128 +137,91 @@ fn image_paths_in_directories(directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn image_contact_sheet(paths: &[PathBuf], cell_width: u16, cell_height: u16) -> Result<tempfile::NamedTempFile> {
-    const COLUMN_PIXELS: u32 = 8;
-    const ROW_PIXELS: u32 = 16;
-    const TILE_PADDING: u32 = 4;
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
 
-    let tile_width = u32::from(cell_width).saturating_mul(COLUMN_PIXELS).max(16);
-    let tile_height = u32::from(cell_height).saturating_mul(ROW_PIXELS).max(16);
-    let mut sheet = image::RgbaImage::from_pixel(
-        tile_width.saturating_mul(3),
-        tile_height.saturating_mul(3),
-        image::Rgba([0, 0, 0, 255]),
-    );
-    for (index, path) in paths.iter().take(9).enumerate() {
-        let decoded = match witchcraft::mobileclip2::decode_image_oriented(path)
-            .map_err(anyhow::Error::from)
-        {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                eprintln!("warning: could not display {}: {error}", path.display());
-                continue;
-            },
-        };
-        let available_width = tile_width.saturating_sub(TILE_PADDING.saturating_mul(2));
-        let available_height = tile_height.saturating_sub(TILE_PADDING.saturating_mul(2));
-        let thumbnail = decoded.thumbnail(available_width, available_height).to_rgba8();
-        let column = (index % 3) as u32;
-        let row = (index / 3) as u32;
-        let x = column * tile_width + (tile_width - thumbnail.width()) / 2;
-        let y = row * tile_height + (tile_height - thumbnail.height()) / 2;
-        image::imageops::overlay(&mut sheet, &thumbnail, i64::from(x), i64::from(y));
+fn file_url(path: &Path) -> String {
+    let path = witchcraft::normalize_image_path(path);
+    let path = path.to_string_lossy();
+    let path = path.replace('\\', "/");
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/' | b':') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
     }
+    if encoded.starts_with("//") {
+        format!("file:{encoded}")
+    } else if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
 
-    let file = tempfile::Builder::new().suffix(".png").tempfile()?;
-    sheet.save(file.path())?;
-    Ok(file)
+fn image_grid_html(paths: &[PathBuf]) -> String {
+    let mut tiles = String::new();
+    for path in paths.iter().take(9) {
+        let url = file_url(path);
+        let label = html_escape(&path.to_string_lossy());
+        tiles.push_str(&format!(
+            "<figure><a href=\"{url}\"><img src=\"{url}\" alt=\"{label}\"></a><figcaption>{label}</figcaption></figure>\n"
+        ));
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Witchcraft image results</title><style>\
+         html,body{{margin:0;min-height:100%;background:#111;color:#ddd;font-family:system-ui,sans-serif}}\
+         main{{box-sizing:border-box;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:12px;height:100vh}}\
+         figure{{min-width:0;min-height:0;margin:0;display:flex;flex-direction:column;background:#1b1b1b;border-radius:5px;overflow:hidden}}\
+         a{{display:flex;min-height:0;flex:1}}img{{display:block;width:100%;height:100%;object-fit:contain}}\
+         figcaption{{padding:5px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}}\
+         </style></head><body><main>{tiles}</main></body></html>"
+    )
+}
+
+fn open_image_grid(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command.arg(path);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+    command.spawn().map(|_| ())
 }
 
 pub fn display_image_grid(paths: &[PathBuf]) {
     if paths.is_empty() || !std::io::stdout().is_terminal() {
         return;
     }
-    let viu_available = Command::new("viu")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    if !viu_available {
+    let preview = env::temp_dir().join("witchcraft-image-preview.html");
+    if let Err(error) = std::fs::write(&preview, image_grid_html(paths)) {
+        eprintln!("warning: could not write image preview: {error}");
         return;
     }
-
-    let (terminal_width, terminal_height) = terminal_dimensions().unwrap_or((120, 40));
-    let horizontal_margin = 2u16;
-    let top_margin = 1u16;
-    let bottom_margin = 4u16;
-    let grid_width = terminal_width
-        .saturating_sub(horizontal_margin.saturating_mul(2))
-        .max(3);
-    let grid_height = terminal_height
-        .saturating_sub(top_margin.saturating_add(bottom_margin))
-        .max(3);
-    let cell_width = (grid_width / 3).max(1);
-    let cell_height = (grid_height / 3).max(1);
-    let sheet = match image_contact_sheet(paths, cell_width, cell_height) {
-        Ok(sheet) => sheet,
-        Err(error) => {
-            eprintln!("warning: could not build image grid: {error}");
-            return;
-        },
-    };
-
-    print!("\x1b[2J\x1b[H");
-    let _ = std::io::stdout().flush();
-    let child = Command::new("viu")
-        .args([
-            "-a",
-            "-x",
-            &horizontal_margin.to_string(),
-            "-y",
-            &top_margin.to_string(),
-            "-w",
-            &grid_width.to_string(),
-            "-h",
-            &grid_height.to_string(),
-            "-s",
-        ])
-        .arg(sheet.path())
-        .spawn();
-    let Ok(mut child) = child else {
-        return;
-    };
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    eprintln!("warning: viu could not display image grid");
-                }
-                break;
-            },
-            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
-                std::thread::sleep(Duration::from_millis(10));
-            },
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                eprintln!("warning: viu timed out; skipping image grid");
-                return;
-            },
-            Err(error) => {
-                eprintln!("warning: could not wait for viu: {error}");
-                return;
-            },
-        }
+    if let Err(error) = open_image_grid(&preview) {
+        eprintln!("warning: could not open image preview: {error}");
     }
-    let cursor_row = top_margin
-        .saturating_add(cell_height.saturating_mul(3))
-        .saturating_add(1)
-        .min(terminal_height.saturating_sub(1).max(1));
-    print!("\x1b[{cursor_row};1H");
-    let _ = std::io::stdout().flush();
 }
 
 pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
@@ -335,53 +282,23 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
                 args[0]
             );
         },
-        "clipembedimages" => {
+        "clipregister" => {
             anyhow::ensure!(
-                args.len() >= 4,
-                "clipembedimages expects <matrix> <directory>..."
+                args.len() >= 3,
+                "clipregister expects <directory>..."
             );
-            let directories = args[3..].iter().map(PathBuf::from).collect::<Vec<_>>();
+            let directories = args[2..].iter().map(PathBuf::from).collect::<Vec<_>>();
             let paths = image_paths_in_directories(&directories)?;
             anyhow::ensure!(!paths.is_empty(), "no supported images found under the supplied directories");
-            let device = witchcraft::make_device();
-            let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
-            super::mobileclip2_matrix::create(&model, &paths, Path::new(&args[2]))?;
+            super::mobileclip2_ivf::register(&paths)?;
         },
-        "clipquery" => {
-            let display_images = args.get(2).is_some_and(|argument| argument == "-d");
-            let matrix_index = if display_images { 3 } else { 2 };
-            anyhow::ensure!(
-                args.len() > matrix_index + 1,
-                "clipquery expects [-d] <matrix> <text>..."
-            );
-            let text = args[matrix_index + 1..].join(" ");
-            let device = witchcraft::make_device();
-            let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
-            let results = super::mobileclip2_matrix::query(
-                &model,
-                Path::new(&args[matrix_index]),
-                &text,
-                10,
-            )?;
-            let image_paths = results
-                .iter()
-                .map(|(score, path)| {
-                    println!("{score:.8}: {}", path.display());
-                    path.clone()
-                })
-                .collect::<Vec<_>>();
-            if display_images {
-                display_image_grid(&image_paths);
-            }
+        "clipembed" => {
+            anyhow::ensure!(args.len() == 2, "clipembed takes no arguments");
+            super::mobileclip2_ivf::embed(assets)?;
         },
-        "clipivfbuild" => {
-            let force = args.get(2).is_some_and(|argument| argument == "--force");
-            let matrix_index = if force { 3 } else { 2 };
-            anyhow::ensure!(
-                args.len() == matrix_index + 1,
-                "clipivfbuild expects [--force] <matrix>"
-            );
-            super::mobileclip2_ivf::build(Path::new(&args[matrix_index]), force)?;
+        "clipindex" => {
+            anyhow::ensure!(args.len() == 2, "clipindex takes no arguments");
+            super::mobileclip2_ivf::update_index()?;
         },
         "clipivfquery" => {
             let display_images = args[2..].iter().any(|argument| argument == "-d");
@@ -468,8 +385,33 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::image_paths_in_directories;
+    use super::{file_url, image_grid_html, image_paths_in_directories};
     use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn image_preview_encodes_paths_and_escapes_labels() {
+        let path = PathBuf::from("/tmp/a photo & <copy>.jpg");
+        let html = image_grid_html(&[path]);
+        assert!(html.contains("file:///tmp/a%20photo%20%26%20%3Ccopy%3E.jpg"));
+        assert!(html.contains("/tmp/a photo &amp; &lt;copy&gt;.jpg"));
+    }
+
+    #[test]
+    fn file_urls_support_windows_paths() {
+        assert_eq!(
+            file_url(Path::new(r"C:\Photos\summer trip.jpg")),
+            "file:///C:/Photos/summer%20trip.jpg"
+        );
+        assert_eq!(
+            file_url(Path::new(r"\\?\C:\Photos\summer trip.jpg")),
+            "file:///C:/Photos/summer%20trip.jpg"
+        );
+        assert_eq!(
+            file_url(Path::new(r"\\?\UNC\server\Photos\summer trip.jpg")),
+            "file://server/Photos/summer%20trip.jpg"
+        );
+    }
 
     #[test]
     fn collects_multiple_directories_recursively_without_duplicates() {

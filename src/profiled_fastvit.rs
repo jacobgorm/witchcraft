@@ -186,6 +186,57 @@ struct MobileOneBlock {
     use_act: bool,
 }
 
+fn identity_depthwise_kernel(
+    channels: usize,
+    kernel: usize,
+    dtype: DType,
+    device: &Device,
+) -> Result<Tensor> {
+    let mut values = vec![0.0f32; channels * kernel * kernel];
+    let center = kernel * kernel / 2;
+    for channel in 0..channels {
+        values[channel * kernel * kernel + center] = 1.0;
+    }
+    Tensor::from_vec(values, (channels, 1, kernel, kernel), device)?.to_dtype(dtype)
+}
+
+fn fuse_repmixer_convs(mixer: &Conv2d, norm: &Conv2d, gamma: &Tensor) -> Result<Conv2d> {
+    let (channels, depth, kernel_h, kernel_w) = mixer.weight().dims4()?;
+    if depth != 1 || kernel_h != kernel_w || norm.weight().dims4()? != (channels, depth, kernel_h, kernel_w) {
+        candle_core::bail!("RepMixer requires matching depthwise convolution weights")
+    }
+    let identity = identity_depthwise_kernel(
+        channels,
+        kernel_h,
+        mixer.weight().dtype(),
+        mixer.weight().device(),
+    )?;
+    let scale = gamma.reshape((channels, 1, 1, 1))?;
+    let weight = (identity + (mixer.weight() - norm.weight())?.broadcast_mul(&scale)?)?;
+    let mixer_bias = mixer.bias().context("RepMixer mixer convolution has no bias")?;
+    let norm_bias = norm.bias().context("RepMixer norm convolution has no bias")?;
+    let bias = (mixer_bias - norm_bias)?.broadcast_mul(&gamma.flatten_all()?)?;
+    Ok(Conv2d::new(weight, Some(bias), *mixer.config()))
+}
+
+fn fuse_residual_depthwise_conv(conv: &Conv2d) -> Result<Conv2d> {
+    let (channels, depth, kernel_h, kernel_w) = conv.weight().dims4()?;
+    if depth != 1 || kernel_h != kernel_w {
+        candle_core::bail!("residual fusion requires a square depthwise convolution")
+    }
+    let identity = identity_depthwise_kernel(
+        channels,
+        kernel_h,
+        conv.weight().dtype(),
+        conv.weight().device(),
+    )?;
+    Ok(Conv2d::new(
+        (conv.weight() + identity)?,
+        conv.bias().cloned(),
+        *conv.config(),
+    ))
+}
+
 impl MobileOneBlock {
     fn new(
         in_channels: usize,
@@ -301,9 +352,7 @@ impl MobileOneBlock {
 
 #[derive(Clone, Debug)]
 struct Repmixer {
-    gamma: Tensor,
-    norm: MobileOneBlock,
-    mixer: MobileOneBlock,
+    reparam_conv: Conv2d,
 }
 
 impl Repmixer {
@@ -311,14 +360,19 @@ impl Repmixer {
         let gamma = vb.get((dim, 1, 1), "layer_scale.gamma")?;
         let norm = MobileOneBlock::new(dim, dim, kernel, 1, 1, false, vb.pp("norm"))?;
         let mixer = MobileOneBlock::new(dim, dim, kernel, 1, 1, false, vb.pp("mixer"))?;
-        Ok(Self { gamma, norm, mixer })
+        if norm.se.is_some() || mixer.se.is_some() || norm.use_act || mixer.use_act {
+            candle_core::bail!("RepMixer MobileOne branches must be linear")
+        }
+        let reparam_conv = fuse_repmixer_convs(
+            &mixer.reparam_conv,
+            &norm.reparam_conv,
+            &gamma,
+        )?;
+        Ok(Self { reparam_conv })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let residual = xs.clone();
-        let xs = (self.mixer.forward(xs)? - self.norm.forward(xs)?)?;
-        let xs = xs.broadcast_mul(&self.gamma.reshape((1, (), 1, 1))?)?;
-        xs + residual
+        apply_conv2d(xs, &self.reparam_conv)
     }
 
     fn forward_profiled(
@@ -328,17 +382,8 @@ impl Repmixer {
         profile: &mut ImageProfile,
         device: &Device,
     ) -> Result<Tensor> {
-        let residual = xs.clone();
-        let mixer = self
-            .mixer
-            .forward_profiled(xs, &format!("{label}.mixer"), profile, device)?;
-        let norm = self
-            .norm
-            .forward_profiled(xs, &format!("{label}.norm"), profile, device)?;
-        profile.time(device, format!("{label}.scale_residual"), || {
-            let xs = (mixer - norm)?;
-            let xs = xs.broadcast_mul(&self.gamma.reshape((1, (), 1, 1))?)?;
-            xs + residual
+        profile.time(device, format!("{label}.conv"), || {
+            apply_conv2d(xs, &self.reparam_conv)
         })
     }
 }
@@ -395,11 +440,12 @@ impl PositionalEncoding {
             ..Default::default()
         };
         let conv = conv2d(dim, dim, 7, conv2d_cfg, vb.pp("pos_enc"))?;
+        let conv = fuse_residual_depthwise_conv(&conv)?;
         Ok(Self { conv })
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs + apply_conv2d(xs, &self.conv)?
+        apply_conv2d(xs, &self.conv)
     }
 
     fn forward_profiled(
@@ -904,4 +950,62 @@ fn fuse_conv_bn(weights: &Tensor, bn: BatchNorm) -> Result<(Tensor, Tensor)> {
     let bias = (beta - mu * &gps)?;
     let weights = weights.broadcast_mul(&gps.reshape(((), 1, 1, 1))?)?;
     Ok((weights, bias))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_depthwise_conv(weight_offset: f32) -> Result<Conv2d> {
+        let weights = (0..18)
+            .map(|index| weight_offset + index as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let weights = Tensor::from_vec(weights, (2, 1, 3, 3), &Device::Cpu)?;
+        let bias = Tensor::from_vec(vec![weight_offset, -weight_offset], 2, &Device::Cpu)?;
+        Ok(Conv2d::new(
+            weights,
+            Some(bias),
+            Conv2dConfig {
+                padding: 1,
+                groups: 2,
+                ..Default::default()
+            },
+        ))
+    }
+
+    fn test_input() -> Result<Tensor> {
+        let values = (0..50)
+            .map(|index| index as f32 / 25.0 - 1.0)
+            .collect::<Vec<_>>();
+        Tensor::from_vec(values, (1, 2, 5, 5), &Device::Cpu)
+    }
+
+    fn assert_close(reference: &Tensor, actual: &Tensor) -> Result<()> {
+        let max_error = (reference - actual)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(max_error < 1e-5, "maximum fusion error was {max_error}");
+        Ok(())
+    }
+
+    #[test]
+    fn repmixer_fusion_matches_training_graph() -> Result<()> {
+        let mixer = test_depthwise_conv(0.2)?;
+        let norm = test_depthwise_conv(-0.1)?;
+        let gamma = Tensor::from_vec(vec![0.25f32, -0.5], (2, 1, 1), &Device::Cpu)?;
+        let input = test_input()?;
+        let delta = (input.apply(&mixer)? - input.apply(&norm)?)?;
+        let reference = (&input + delta.broadcast_mul(&gamma.reshape((1, 2, 1, 1))?)?)?;
+
+        let fused = fuse_repmixer_convs(&mixer, &norm, &gamma)?;
+        assert_close(&reference, &input.apply(&fused)?)
+    }
+
+    #[test]
+    fn positional_encoding_fusion_matches_residual_graph() -> Result<()> {
+        let conv = test_depthwise_conv(0.15)?;
+        let input = test_input()?;
+        let reference = (&input + input.apply(&conv)?)?;
+
+        let fused = fuse_residual_depthwise_conv(&conv)?;
+        assert_close(&reference, &input.apply(&fused)?)
+    }
 }

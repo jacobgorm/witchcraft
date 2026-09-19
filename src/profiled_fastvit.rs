@@ -6,6 +6,30 @@ use candle_nn::{
 use candle_transformers::models::fastvit::Config;
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+fn d3d12_command_batch<T>(device: &Device, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let Device::D3D12(device) = device else {
+        return f();
+    };
+    let gpu = device.gpu();
+    gpu.begin_batch().map_err(candle_core::Error::wrap)?;
+    let output = f();
+    let finish = gpu
+        .is_batch_active()
+        .then(|| gpu.end_batch().map_err(candle_core::Error::wrap))
+        .transpose();
+    match output {
+        Ok(value) => {
+            finish?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = finish;
+            Err(error)
+        }
+    }
+}
+
 fn apply_conv2d(xs: &Tensor, conv: &Conv2d) -> Result<Tensor> {
     #[cfg(all(feature = "neso-metal", target_os = "macos"))]
     if let Some(output) = crate::neso_metal_kernels::image_conv2d(xs, conv)? {
@@ -893,15 +917,30 @@ impl ProfiledFastVit {
     }
 
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.forward_features(xs)?
-            .mean(D::Minus2)?
-            .mean(D::Minus1)?
-            .apply(&self.cls)
+        #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+        if matches!(self.device, Device::D3D12(_)) {
+            return d3d12_command_batch(&self.device, || {
+                self.forward_features(xs)?
+                    .mean(D::Minus2)?
+                    .mean(D::Minus1)?
+                    .apply(&self.cls)
+            });
+        }
+        self.forward_features(xs)?.mean(D::Minus2)?.mean(D::Minus1)?.apply(&self.cls)
     }
 
     /// Return the projected spatial grid before global average pooling.
     #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
     pub fn forward_patches(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+        if matches!(self.device, Device::D3D12(_)) {
+            return d3d12_command_batch(&self.device, || {
+                self.forward_features(xs)?
+                    .flatten_from(2)?
+                    .transpose(D::Minus1, D::Minus2)?
+                    .apply(&self.cls)
+            });
+        }
         self.forward_features(xs)?
             .flatten_from(2)?
             .transpose(D::Minus1, D::Minus2)?

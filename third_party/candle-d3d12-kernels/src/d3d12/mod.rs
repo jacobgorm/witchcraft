@@ -18,6 +18,7 @@ const MAX_UAVS: u32 = 8;
 const DESCRIPTOR_COUNT: u32 = MAX_SRVS + MAX_UAVS;
 
 /// A GPU buffer in default (device-local) heap.
+#[derive(Clone)]
 pub struct GpuBuffer {
     pub(crate) resource: ID3D12Resource,
     pub(crate) size_bytes: u64,
@@ -134,6 +135,7 @@ pub struct Gpu {
     // Batch dispatch state: descriptor offset within the heap
     batch_offset: std::cell::Cell<u32>,
     batch_active: std::cell::Cell<bool>,
+    batch_resources: std::cell::RefCell<Vec<GpuBuffer>>,
 }
 
 // The Gpu struct contains raw HANDLE which isn't Send/Sync by default.
@@ -311,6 +313,7 @@ impl Gpu {
                 root_signature,
                 batch_offset: std::cell::Cell::new(0),
                 batch_active: std::cell::Cell::new(false),
+                batch_resources: std::cell::RefCell::new(Vec::new()),
             })
         }
     }
@@ -492,6 +495,10 @@ impl Gpu {
         data: &[u8],
         dst: &GpuBuffer,
     ) -> Result<(), D3D12KernelError> {
+        let resume_batch = self.batch_active.get();
+        if resume_batch {
+            self.end_batch()?;
+        }
         let size = data.len() as u64;
         assert!(size <= dst.size_bytes);
 
@@ -548,6 +555,10 @@ impl Gpu {
         }
         self.execute_and_wait()?;
 
+        if resume_batch {
+            self.begin_batch()?;
+        }
+
         Ok(())
     }
 
@@ -557,6 +568,10 @@ impl Gpu {
         src: &GpuBuffer,
         size_bytes: u64,
     ) -> Result<Vec<u8>, D3D12KernelError> {
+        let resume_batch = self.batch_active.get();
+        if resume_batch {
+            self.end_batch()?;
+        }
         let size = std::cmp::min(size_bytes, src.size_bytes);
 
         // Create readback buffer
@@ -611,6 +626,10 @@ impl Gpu {
                 .map_err(|e| D3D12KernelError::DataTransfer(e.to_string()))?;
             std::ptr::copy_nonoverlapping(mapped as *const u8, result.as_mut_ptr(), size as usize);
             readback_buf.Unmap(0, None);
+        }
+
+        if resume_batch {
+            self.begin_batch()?;
         }
 
         Ok(result)
@@ -689,7 +708,7 @@ impl Gpu {
         Ok(pso)
     }
 
-    /// Run a compute dispatch synchronously.
+    /// Run a compute dispatch synchronously, or append it to the active batch.
     ///
     /// - `pso`: The pipeline state object for the kernel.
     /// - `root_constants`: Up to 16 u32 values for cbuffer at register(b0).
@@ -706,6 +725,11 @@ impl Gpu {
     ) -> Result<(), D3D12KernelError> {
         assert!(root_constants.len() <= MAX_ROOT_CONSTANTS as usize);
         assert!(srvs.len() <= MAX_SRVS as usize);
+
+        if self.batch_active.get() {
+            self.record_uav_barrier();
+            return self.record_dispatch_inner(pso, root_constants, srvs, std::slice::from_ref(uav), groups);
+        }
 
         unsafe {
             self.begin_command_list()?;
@@ -854,6 +878,7 @@ impl Gpu {
     /// Call `end_batch()` to execute all recorded dispatches at once.
     pub fn begin_batch(&self) -> Result<(), D3D12KernelError> {
         self.batch_offset.set(0);
+        self.batch_resources.borrow_mut().clear();
         self.batch_active.set(true);
         self.begin_command_list()?;
         unsafe {
@@ -898,14 +923,34 @@ impl Gpu {
             return self.dispatch_uav_only(pso, root_constants, uavs, groups);
         }
 
+        self.record_dispatch_inner(pso, root_constants, &[], uavs, groups)
+    }
+
+    fn record_dispatch_inner(
+        &self,
+        pso: &ID3D12PipelineState,
+        root_constants: &[u32],
+        srvs: &[BufferBinding],
+        uavs: &[BufferBinding],
+        groups: [u32; 3],
+    ) -> Result<(), D3D12KernelError> {
         assert!(root_constants.len() <= MAX_ROOT_CONSTANTS as usize);
+        assert!(srvs.len() <= MAX_SRVS as usize);
         assert!(uavs.len() <= MAX_UAVS as usize);
 
+        if self.batch_offset.get() == MAX_BATCH_DISPATCHES {
+            self.end_batch()?;
+            self.begin_batch()?;
+        }
+
         let offset = self.batch_offset.get();
-        assert!(
-            offset < MAX_BATCH_DISPATCHES,
-            "batch dispatch limit exceeded"
-        );
+        {
+            // D3D12 command lists do not retain referenced resources. Candle
+            // may drop temporary tensors before the deferred batch executes.
+            let mut resources = self.batch_resources.borrow_mut();
+            resources.extend(srvs.iter().map(|binding| binding.buffer.clone()));
+            resources.extend(uavs.iter().map(|binding| binding.buffer.clone()));
+        }
 
         unsafe {
             self.list.SetPipelineState(pso);
@@ -927,7 +972,12 @@ impl Gpu {
                 ptr: gpu_start.ptr + (desc_base as u64) * (self.srv_uav_increment as u64),
             };
 
-            // SRV slots pre-filled with null at init time — skip here.
+            for (i, srv) in srvs.iter().enumerate() {
+                let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu_base.ptr + (i as u32 * self.srv_uav_increment) as usize,
+                };
+                self.create_srv(&srv.buffer.resource, srv, handle);
+            }
 
             // Fill UAV slots
             for (i, uav) in uavs.iter().enumerate() {
@@ -967,6 +1017,10 @@ impl Gpu {
         self.execute_and_wait()?;
         self.batch_offset.set(0);
         Ok(())
+    }
+
+    pub fn is_batch_active(&self) -> bool {
+        self.batch_active.get()
     }
 
     /// Compile an HLSL compute shader targeting SM 6.2+ with DXC.
@@ -1076,6 +1130,10 @@ impl Gpu {
         dst_offset_bytes: u64,
         size_bytes: u64,
     ) -> Result<(), D3D12KernelError> {
+        let resume_batch = self.batch_active.get();
+        if resume_batch {
+            self.end_batch()?;
+        }
         self.begin_command_list()?;
         unsafe {
             self.list.CopyBufferRegion(
@@ -1087,6 +1145,9 @@ impl Gpu {
             );
         }
         self.execute_and_wait()?;
+        if resume_batch {
+            self.begin_batch()?;
+        }
         Ok(())
     }
 

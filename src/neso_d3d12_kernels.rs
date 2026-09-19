@@ -143,6 +143,7 @@ fn depthwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Ten
                 uav_f32_offset(db.buffer(), lb.start_offset(), bias.elem_count()),
                 uav_f32_offset(dout.buffer(), lo.start_offset(), out.elem_count()),
             ];
+            kernels.gpu.record_uav_barrier();
             kernels
                 .gpu
                 .record_dispatch(pipeline, &constants, &uavs, [grid_x, grid_y, 1])
@@ -220,6 +221,7 @@ fn pointwise_conv2d(x: &Tensor, conv: &Conv2d) -> candle_core::Result<Option<Ten
                         output_channels * spatial_size,
                     ),
                 ];
+                kernels.gpu.record_uav_barrier();
                 kernels
                     .gpu
                     .record_dispatch(
@@ -534,6 +536,8 @@ pub fn d3d12_flash_attention_bias(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_core::Device;
+    use candle_nn::Conv2dConfig;
 
     fn buffer_f16(gpu: &Gpu, values: &[half::f16]) -> Result<GpuBuffer> {
         let buffer = create_f16_buffer(gpu, values.len())?;
@@ -547,6 +551,54 @@ mod tests {
         let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
         upload_bytes(gpu, &bytes, &buffer)?;
         Ok(buffer)
+    }
+
+    #[test]
+    fn mixed_candle_neso_batch_keeps_resources_alive() -> Result<()> {
+        let device = candle_core::Device::new_d3d12(0)?;
+        let gpu = match &device {
+            candle_core::Device::D3D12(device) => device.gpu(),
+            _ => unreachable!(),
+        };
+        let input_values = (0..32 * 32)
+            .map(|i| ((i * 17 % 31) as f32 - 15.0) / 19.0)
+            .collect::<Vec<_>>();
+        let weight_values = (0..16 * 32)
+            .map(|i| ((i * 11 % 29) as f32 - 14.0) / 23.0)
+            .collect::<Vec<_>>();
+        let bias_values = (0..16).map(|i| i as f32 / 31.0 - 0.25).collect::<Vec<_>>();
+        let x = Tensor::from_vec(input_values.clone(), (1, 32, 1, 32), &device)?;
+        let conv = Conv2d::new(
+            Tensor::from_vec(weight_values.clone(), (16, 32, 1, 1), &device)?,
+            Some(Tensor::from_vec(bias_values.clone(), 16, &device)?),
+            Conv2dConfig::default(),
+        );
+
+        gpu.begin_batch().map_err(|e| anyhow::anyhow!("begin_batch: {e}"))?;
+        let shifted = x.affine(1.0, 0.25)?;
+        let actual = image_conv2d(&shifted, &conv)?.unwrap().gelu_erf()?;
+        gpu.end_batch().map_err(|e| anyhow::anyhow!("end_batch: {e}"))?;
+        let actual = actual.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+
+        let cpu_x = Tensor::from_vec(input_values, (1, 32, 1, 32), &Device::Cpu)?;
+        let cpu_conv = Conv2d::new(
+            Tensor::from_vec(weight_values, (16, 32, 1, 1), &Device::Cpu)?,
+            Some(Tensor::from_vec(bias_values, 16, &Device::Cpu)?),
+            Conv2dConfig::default(),
+        );
+        let expected = cpu_x
+            .affine(1.0, 0.25)?
+            .apply(&cpu_conv)?
+            .gelu_erf()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let max_error = actual
+            .iter()
+            .zip(expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        anyhow::ensure!(max_error < 1e-4, "mixed batch max error {max_error}");
+        Ok(())
     }
 
     #[test]

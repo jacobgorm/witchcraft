@@ -72,36 +72,84 @@ pub fn embed(assets: &Path) -> Result<()> {
     let progress = witchcraft::progress::new_with_label(missing.len() as u64, "embed images");
     let mut embedded = 0usize;
     let mut failed = 0usize;
-    for documents in missing.chunks(BATCH_SIZE) {
-        let mut images = Vec::with_capacity(documents.len());
-        let mut valid = Vec::with_capacity(documents.len());
-        for (rowid, path) in documents {
-            match witchcraft::mobileclip2::load_image(path, model.image_size()) {
-                Ok(image) => {
-                    images.push(image);
-                    valid.push((*rowid, path));
-                },
-                Err(error) => {
-                    failed += 1;
-                    eprintln!("[WARN] skipping rowid {rowid} ({}): {error}", path.display());
+    // Keep two prepared batches queued so image reads and decoding overlap the
+    // current GPU forward pass without allowing decoded tensors to grow unbounded.
+    let (prepared_tx, prepared_rx) = std::sync::mpsc::sync_channel(2);
+    let image_size = model.image_size();
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for documents in missing.chunks(BATCH_SIZE) {
+                let prepared = std::thread::scope(|decode_scope| {
+                    let workers = documents
+                        .iter()
+                        .map(|(rowid, path)| {
+                            let rowid = *rowid;
+                            let path = path.clone();
+                            decode_scope.spawn(move || {
+                                let image = witchcraft::mobileclip2::load_image(&path, image_size)
+                                    .map_err(anyhow::Error::from);
+                                (rowid, path, image)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("image preparation worker panicked"))
+                        .collect::<Vec<_>>()
+                });
+                if prepared_tx.send(prepared).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut pipeline_error = None;
+        while let Ok(prepared) = prepared_rx.recv() {
+            let batch_result = (|| -> Result<()> {
+                let mut images = Vec::with_capacity(prepared.len());
+                let mut valid = Vec::with_capacity(prepared.len());
+                for (rowid, path, image) in prepared {
+                    match image {
+                        Ok(image) => {
+                            images.push(image);
+                            valid.push((rowid, path));
+                        },
+                        Err(error) => {
+                            failed += 1;
+                            eprintln!(
+                                "[WARN] skipping rowid {rowid} ({}): {error}",
+                                path.display()
+                            );
+                            progress.inc(1);
+                        },
+                    }
+                }
+                if images.is_empty() {
+                    return Ok(());
+                }
+
+                let batch = Tensor::stack(&images, 0)?;
+                let outputs = model.embed_images(&batch)?;
+                anyhow::ensure!(outputs.dim(0)? == valid.len(), "MobileCLIP2 batch size changed");
+                for (index, (rowid, _path)) in valid.into_iter().enumerate() {
+                    let output = outputs.get(index)?.unsqueeze(0)?.unsqueeze(0)?;
+                    witchcraft::cache_precomputed_l2_int8_image_embeddings(&db, rowid, output)?;
+                    embedded += 1;
                     progress.inc(1);
-                },
+                }
+                Ok(())
+            })();
+            if let Err(error) = batch_result {
+                pipeline_error = Some(error);
+                break;
             }
         }
-        if images.is_empty() {
-            continue;
+        drop(prepared_rx);
+        match pipeline_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-
-        let batch = Tensor::stack(&images, 0)?;
-        let outputs = model.embed_images(&batch)?;
-        anyhow::ensure!(outputs.dim(0)? == valid.len(), "MobileCLIP2 batch size changed");
-        for (index, (rowid, _path)) in valid.into_iter().enumerate() {
-            let output = outputs.get(index)?.unsqueeze(0)?.unsqueeze(0)?;
-            witchcraft::cache_precomputed_l2_int8_image_embeddings(&db, rowid, output)?;
-            embedded += 1;
-            progress.inc(1);
-        }
-    }
+    })?;
     progress.finish();
     db.checkpoint();
     println!(

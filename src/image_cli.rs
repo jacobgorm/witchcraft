@@ -479,13 +479,19 @@ mod tests {
         fs::create_dir_all(&second).unwrap();
         fs::write(first.join("one.JPG"), []).unwrap();
         fs::write(nested.join("two.heic"), []).unwrap();
+        fs::write(nested.join("four.jxl"), []).unwrap();
         fs::write(nested.join("ignored.txt"), []).unwrap();
         fs::write(second.join("three.heif"), []).unwrap();
 
         let paths = image_paths_in_directories(&[first.clone(), nested, second.clone()]).unwrap();
         assert_eq!(
             paths,
-            vec![first.join("nested/two.heic"), first.join("one.JPG"), second.join("three.heif")]
+            vec![
+                first.join("nested/four.jxl"),
+                first.join("nested/two.heic"),
+                first.join("one.JPG"),
+                second.join("three.heif"),
+            ]
         );
     }
 }

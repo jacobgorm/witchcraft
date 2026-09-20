@@ -393,6 +393,7 @@ fn is_supported_image_path(path: &Path) -> bool {
                         | "tiff"
                         | "heic"
                         | "heif"
+                        | "jxl"
                 )
             })
             .unwrap_or(false)

@@ -947,8 +947,16 @@ fn is_heif_header(header: &[u8]) -> bool {
     )
 }
 
+fn is_jxl_header(header: &[u8]) -> bool {
+    header.starts_with(&[0xff, 0x0a])
+        || header.starts_with(&[
+            0x00, 0x00, 0x00, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+        ])
+}
+
 enum ImageSource {
     Heif,
+    Jxl(BufReader<std::fs::File>),
     Standard(image::ImageReader<BufReader<std::fs::File>>),
 }
 
@@ -961,6 +969,9 @@ fn open_image_source(path: &Path) -> candle_core::Result<ImageSource> {
     }
     file.seek(SeekFrom::Start(0))
         .map_err(candle_core::Error::wrap)?;
+    if is_jxl_header(&header[..read]) {
+        return Ok(ImageSource::Jxl(BufReader::new(file)));
+    }
     let reader = image::ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .map_err(candle_core::Error::wrap)?;
@@ -982,6 +993,15 @@ fn decode_heif(path: &Path) -> candle_core::Result<image::DynamicImage> {
     Ok(image::DynamicImage::ImageRgba8(image))
 }
 
+fn decode_jxl(
+    path: &Path,
+    reader: BufReader<std::fs::File>,
+) -> candle_core::Result<image::DynamicImage> {
+    let decoder = jxl_oxide::integration::JxlDecoder::new(reader)
+        .map_err(|error| Error::other(format!("failed to decode {}: {error}", path.display())))?;
+    image::DynamicImage::from_decoder(decoder).map_err(candle_core::Error::wrap)
+}
+
 pub fn validate_image_header<P: AsRef<Path>>(path: P) -> candle_core::Result<()> {
     open_image_source(path.as_ref()).map(|_| ())
 }
@@ -990,6 +1010,7 @@ pub fn decode_image<P: AsRef<Path>>(path: P) -> candle_core::Result<image::Dynam
     let path = path.as_ref();
     match open_image_source(path)? {
         ImageSource::Heif => decode_heif(path),
+        ImageSource::Jxl(reader) => decode_jxl(path, reader),
         ImageSource::Standard(reader) => reader.decode().map_err(candle_core::Error::wrap),
     }
 }
@@ -1000,6 +1021,8 @@ pub fn decode_image_oriented<P: AsRef<Path>>(path: P) -> candle_core::Result<ima
     let path = path.as_ref();
     match open_image_source(path)? {
         ImageSource::Heif => decode_heif(path),
+        // jxl-oxide applies the JPEG XL orientation while rendering.
+        ImageSource::Jxl(reader) => decode_jxl(path, reader),
         ImageSource::Standard(reader) => {
             let mut decoder = reader.into_decoder().map_err(candle_core::Error::wrap)?;
             let orientation = decoder.orientation().map_err(candle_core::Error::wrap)?;
@@ -1114,6 +1137,36 @@ mod image_preprocessing_tests {
 
         assert_eq!((decoded.width(), decoded.height()), (2, 1));
         Ok(())
+    }
+
+    #[test]
+    fn decoding_supports_jpeg_xl_by_signature() -> candle_core::Result<()> {
+        // Small valid codestream from the jxl-oxide decoder documentation.
+        let jxl = [
+            0xff, 0x0a, 0x30, 0x54, 0x10, 0x09, 0x08, 0x06, 0x01, 0x00, 0x78, 0x00, 0x4b,
+            0x38, 0x41, 0x3c, 0xb6, 0x3a, 0x51, 0xfe, 0x00, 0x47, 0x1e, 0xa0, 0x85, 0xb8,
+            0x27, 0x1a, 0x48, 0x45, 0x84, 0x1b, 0x71, 0x4f, 0xa8, 0x3e, 0x8e, 0x30, 0x03,
+            0x92, 0x84, 0x01,
+        ];
+        let file = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .map_err(candle_core::Error::wrap)?;
+        std::fs::write(file.path(), jxl).map_err(candle_core::Error::wrap)?;
+
+        let decoded = decode_image_oriented(file.path())?;
+
+        assert!(decoded.width() > 0);
+        assert!(decoded.height() > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recognizes_both_jpeg_xl_signatures() {
+        assert!(is_jxl_header(&[0xff, 0x0a]));
+        assert!(is_jxl_header(&[
+            0x00, 0x00, 0x00, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+        ]));
     }
 
     #[test]

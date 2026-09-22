@@ -154,7 +154,7 @@ pub use sqlite_index::{
     cache_precomputed_image_embeddings, cache_precomputed_image_embeddings_auto,
     cache_precomputed_l2_int8_image_embeddings, cached_document_embedding_tensor,
     cached_image_rowid,
-    register_image_document_auto,
+    register_image_document_auto, update_registered_image_tags,
 };
 #[cfg(all(test, feature = "sqlite"))]
 pub(crate) use sqlite_index::fts5_query;

@@ -1017,6 +1017,25 @@ pub fn validate_image_header<P: AsRef<Path>>(path: P) -> candle_core::Result<()>
     open_image_source(path.as_ref()).map(|_| ())
 }
 
+pub fn decode_exif_metadata<P: AsRef<Path>>(path: P) -> candle_core::Result<Option<Vec<u8>>> {
+    use image::ImageDecoder;
+
+    let path = path.as_ref();
+    match open_image_source(path)? {
+        ImageSource::Heif => Ok(None),
+        ImageSource::Jxl(reader) => {
+            let mut decoder = jxl_oxide::integration::JxlDecoder::new(reader).map_err(|error| {
+                Error::other(format!("failed to inspect {}: {error}", path.display()))
+            })?;
+            decoder.exif_metadata().map_err(candle_core::Error::wrap)
+        },
+        ImageSource::Standard(reader) => {
+            let mut decoder = reader.into_decoder().map_err(candle_core::Error::wrap)?;
+            decoder.exif_metadata().map_err(candle_core::Error::wrap)
+        },
+    }
+}
+
 pub fn decode_image<P: AsRef<Path>>(path: P) -> candle_core::Result<image::DynamicImage> {
     let path = path.as_ref();
     match open_image_source(path)? {

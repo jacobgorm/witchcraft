@@ -522,9 +522,10 @@ fn human_list(values: &[String]) -> String {
 }
 
 pub fn extract(path: &Path, assets: &Path) -> Result<ImageTags> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let exif = match exif::Reader::new().read_from_container(&mut reader) {
+    let Some(raw_exif) = crate::mobileclip2::decode_exif_metadata(path)? else {
+        return Ok(ImageTags::default());
+    };
+    let exif = match exif::Reader::new().read_raw(raw_exif) {
         Ok(exif) => exif,
         Err(exif::Error::NotFound(_)) => return Ok(ImageTags::default()),
         Err(error) => return Err(error.into()),

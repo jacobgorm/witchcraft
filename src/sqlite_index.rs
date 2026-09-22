@@ -1535,6 +1535,25 @@ pub fn cached_document_embedding_tensor(db: &DB, rowid: u64) -> Result<Option<Te
     )?))
 }
 
+#[cfg(feature = "mobileclip2")]
+pub fn update_registered_image_tags(
+    db: &DB,
+    rowid: u64,
+    path: &std::path::Path,
+    tags: &crate::image_tags::ImageTags,
+) -> Result<()> {
+    let path = canonical_image_path(path);
+    let metadata = serde_json::json!({
+        "key": path.to_string_lossy(),
+        "image": tags,
+        "exif_scanned": true,
+    })
+    .to_string();
+    db.query("UPDATE document SET metadata = ?1 WHERE rowid = ?2")?
+        .execute((metadata, i64::try_from(rowid)?))?;
+    Ok(())
+}
+
 /// Register an image document without computing its embeddings. The canonical
 /// path is its stable identity, so repeated registration returns the same rowid.
 #[cfg(feature = "mobileclip2")]

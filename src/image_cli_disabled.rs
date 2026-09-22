@@ -6,6 +6,7 @@ const IMAGE_COMMANDS: &[&str] = &[
     "embedimage",
     "embedimages",
     "clipthumbnails",
+    "cliptag",
     "image",
     "benchimage",
     "scoreimage",

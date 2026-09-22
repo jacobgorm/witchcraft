@@ -378,6 +378,43 @@ fn image_grid_html_with_links(
     )
 }
 
+fn image_cluster_html(
+    clusters: &[(String, Vec<PathBuf>)],
+    thumbnails: &HashMap<PathBuf, PathBuf>,
+) -> String {
+    let mut sections = String::new();
+    for (label, paths) in clusters {
+        let mut tiles = String::new();
+        for (index, path) in paths.iter().enumerate() {
+            let source = thumbnails.get(path).unwrap_or(path);
+            let url = file_url(path);
+            let source_url = file_url(source);
+            let escaped_path = html_escape(&path.to_string_lossy());
+            let class = if index == 0 { " class=\"winner\"" } else { "" };
+            let badge = if index == 0 { "<b>MaxSim</b>" } else { "" };
+            tiles.push_str(&format!(
+                "<figure{class}><a href=\"{url}\"><img loading=\"lazy\" src=\"{source_url}\" alt=\"{escaped_path}\"></a><figcaption>{badge}{escaped_path}</figcaption></figure>\n"
+            ));
+        }
+        sections.push_str(&format!(
+            "<section><h2>{} <small>({} images)</small></h2><div class=\"cluster\">{tiles}</div></section>\n",
+            html_escape(label),
+            paths.len(),
+        ));
+    }
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Witchcraft image clusters</title><style>\
+         html,body{{margin:0;min-height:100%;background:#111;color:#ddd;font-family:system-ui,sans-serif}}\
+         body{{padding:16px}}section{{margin:0 0 28px}}h2{{font-size:18px;margin:0 0 10px}}\
+         h2 small{{color:#999;font-weight:normal}}.cluster{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}}\
+         figure{{min-width:0;margin:0;background:#1b1b1b;border:2px solid transparent;border-radius:5px;overflow:hidden}}\
+         figure.winner{{border-color:#66c2ff}}a{{display:block;height:170px}}img{{display:block;width:100%;height:100%;object-fit:contain}}\
+         figcaption{{padding:5px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}}\
+         figcaption b{{color:#66c2ff;margin-right:7px}}\
+         </style></head><body>{sections}</body></html>"
+    )
+}
+
 #[cfg(test)]
 fn image_grid_html(paths: &[PathBuf]) -> String {
     image_grid_html_with_links(paths, None, None)
@@ -469,6 +506,47 @@ pub fn display_image_grid_with_neighbors(paths: &[PathBuf], neighbors: &[Vec<Pat
     }
 }
 
+fn cluster_preview_data(results: &[(f32, String, Vec<String>, u32, String)]) -> Vec<(String, Vec<PathBuf>)> {
+    results
+        .iter()
+        .filter_map(|(score, metadata, bodies, sub_idx, _)| {
+            if bodies.is_empty() {
+                return None;
+            }
+            let winner = (*sub_idx as usize).min(bodies.len() - 1);
+            let mut paths = bodies
+                .iter()
+                .map(|body| witchcraft::normalize_image_path(Path::new(body)))
+                .collect::<Vec<_>>();
+            paths.swap(0, winner);
+            let key = serde_json::from_str::<serde_json::Value>(metadata)
+                .ok()
+                .and_then(|metadata| metadata.get("cluster")?.get("key")?.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "image cluster".to_owned());
+            Some((format!("{score:.4} — {key}"), paths))
+        })
+        .collect()
+}
+
+fn display_image_clusters(clusters: &[(String, Vec<PathBuf>)]) {
+    if clusters.is_empty() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let paths = clusters
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect::<Vec<_>>();
+    let (thumbnails, _) = generate_thumbnails(&paths, None);
+    let preview = env::temp_dir().join("witchcraft-image-preview.html");
+    if let Err(error) = std::fs::write(&preview, image_cluster_html(clusters, &thumbnails)) {
+        eprintln!("warning: could not write image cluster preview: {error}");
+        return;
+    }
+    if let Err(error) = open_image_grid(&preview) {
+        eprintln!("warning: could not open image cluster preview: {error}");
+    }
+}
+
 pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
     let Some(command) = args.get(1).map(String::as_str) else {
         return Ok(false);
@@ -541,6 +619,10 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             anyhow::ensure!(args.len() == 2, "clipembed takes no arguments");
             super::mobileclip2_ivf::embed(assets)?;
         },
+        "cliptag" => {
+            anyhow::ensure!(args.len() == 2, "cliptag takes no arguments");
+            super::mobileclip2_ivf::enrich_tags(assets)?;
+        },
         "clipthumbnails" => {
             anyhow::ensure!(args.len() == 2, "clipthumbnails takes no arguments");
             let paths = super::mobileclip2_ivf::registered_paths()?;
@@ -554,23 +636,30 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             let display_neighbors = args[2..].iter().any(|argument| argument == "-D");
             let display_images = display_neighbors || args[2..].iter().any(|argument| argument == "-d");
             let exact = args[2..].iter().any(|argument| argument == "--exact");
+            let clustered = args[2..].iter().any(|argument| argument == "--clusters");
             let query_args = args[2..]
                 .iter()
-                .filter(|argument| !matches!(argument.as_str(), "-d" | "-D" | "--exact"))
+                .filter(|argument| {
+                    !matches!(argument.as_str(), "-d" | "-D" | "--exact" | "--clusters")
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 !query_args.is_empty(),
-                "clipquery expects [-d|-D] [--exact] <text>..."
+                "clipquery expects [-d|-D] [--exact] [--clusters] <text>..."
             );
             let results = super::mobileclip2_ivf::query(
                 assets,
                 &query_args.join(" "),
                 10,
                 exact,
+                clustered,
             )?;
+            let clusters = clustered.then(|| cluster_preview_data(&results));
             let image_paths = print_search_results(results);
-            if display_neighbors {
+            if display_images && clustered {
+                display_image_clusters(clusters.as_deref().unwrap_or_default());
+            } else if display_neighbors {
                 let neighbors = super::mobileclip2_ivf::nearest_neighbors(&image_paths, 9)?;
                 display_image_grid_with_neighbors(&image_paths, &neighbors);
             } else if display_images {
@@ -649,9 +738,10 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_thumbnail_in, file_url, image_grid_html, image_grid_html_with_links,
-        image_paths_in_directories, thumbnail_path_in,
+        cluster_preview_data, ensure_thumbnail_in, file_url, image_cluster_html, image_grid_html,
+        image_grid_html_with_links, image_paths_in_directories, thumbnail_path_in,
     };
+    use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -673,6 +763,24 @@ mod tests {
         );
         assert!(html.contains("href=\"file:///tmp/neighbors-0.html\""));
         assert!(html.contains("src=\"file:///tmp/thumb.webp\""));
+    }
+
+    #[test]
+    fn cluster_preview_puts_the_maxsim_winner_first() {
+        let results = vec![(
+            0.42,
+            r#"{"cluster":{"key":"event:2020:01:02|DK|Region|Town"}}"#.to_owned(),
+            vec!["/tmp/first.jpg".to_owned(), "/tmp/winner.jpg".to_owned()],
+            1,
+            String::new(),
+        )];
+        let clusters = cluster_preview_data(&results);
+        assert_eq!(clusters[0].1[0], PathBuf::from("/tmp/winner.jpg"));
+
+        let html = image_cluster_html(&clusters, &HashMap::new());
+        assert!(html.contains("MaxSim"));
+        assert!(html.contains("event:2020:01:02|DK|Region|Town"));
+        assert!(html.contains("(2 images)"));
     }
 
     #[test]

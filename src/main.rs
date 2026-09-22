@@ -408,6 +408,15 @@ fn image_description_from_metadata(metadata: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn image_cluster_from_metadata(metadata: &str) -> Option<(String, usize)> {
+    let metadata = serde_json::from_str::<serde_json::Value>(metadata).ok()?;
+    let cluster = metadata.get("cluster")?;
+    Some((
+        cluster.get("key")?.as_str()?.to_owned(),
+        cluster.get("size")?.as_u64()?.try_into().ok()?,
+    ))
+}
+
 type CliSearchResult = (f32, String, Vec<String>, u32, String);
 
 fn print_search_results(results: Vec<CliSearchResult>) -> Vec<PathBuf> {
@@ -421,6 +430,9 @@ fn print_search_results(results: Vec<CliSearchResult>) -> Vec<PathBuf> {
         if is_image {
             if let Some(description) = image_description_from_metadata(&metadata) {
                 println!("{description}");
+            }
+            if let Some((key, size)) = image_cluster_from_metadata(&metadata) {
+                println!("Cluster {key} ({size} images)");
             }
         }
         println!("=============================================");
@@ -541,7 +553,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipregister <directory>... | clipembed | clipthumbnails | clipindex | clipquery [-d|-D] [--exact] <text>... | index | reindex | saliency <text> | image <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipregister <directory>... | clipembed | cliptag | clipthumbnails | clipindex | clipquery [-d|-D] [--exact] [--clusters] <text>... | index | reindex | saliency <text> | image <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

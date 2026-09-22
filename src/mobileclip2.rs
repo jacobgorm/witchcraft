@@ -13,6 +13,7 @@ use candle_nn::{layer_norm, linear, linear_no_bias, LayerNorm};
 use candle_nn::{Linear, VarBuilder};
 use candle_transformers::models::fastvit;
 use candle_transformers::models::openclip::text_model;
+use image::GenericImageView;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -1068,26 +1069,18 @@ fn preprocess_image(
         return Err(Error::other("input image has zero width or height").into());
     }
 
-    // resize_to_fill scales uniformly until the shorter source dimension fills
-    // the square. Before shrinking, remove frequencies above the destination
-    // Nyquist limit. Assuming roughly half-pixel source reconstruction blur,
-    // variances add under convolution, giving this scale-aware extra sigma.
-    let downsample = (width as f32 / image_size as f32)
-        .min(height as f32 / image_size as f32);
-    let image = if downsample > 1.0 {
-        let sigma = 0.5 * (downsample * downsample - 1.0).sqrt();
-        image.blur(sigma)
-    } else {
-        image
-    };
-
-    Ok(image
-        .resize_to_fill(
-            image_size,
-            image_size,
-            image::imageops::FilterType::Lanczos3,
-        )
-        .to_rgb8())
+    let side = width.min(height);
+    let image = image.into_rgb8();
+    let source = image.view((width - side) / 2, (height - side) / 2, side, side);
+    // Resize directly from the centered source view: Lanczos samples only the
+    // retained region and widens its support according to the downsampling ratio.
+    let resized = image::imageops::resize(
+        &*source,
+        image_size,
+        image_size,
+        image::imageops::FilterType::Lanczos3,
+    );
+    Ok(resized)
 }
 
 #[cfg(test)]
@@ -1128,6 +1121,20 @@ mod image_preprocessing_tests {
         let source = image::DynamicImage::ImageRgb8(image::RgbImage::new(640, 320));
         let resized = preprocess_image(source, 256)?;
         assert_eq!(resized.dimensions(), (256, 256));
+        Ok(())
+    }
+
+    #[test]
+    fn preprocessing_resamples_only_the_center_crop() -> candle_core::Result<()> {
+        let mut source = image::RgbImage::from_pixel(640, 320, image::Rgb([0, 255, 0]));
+        for y in 0..320 {
+            for x in 160..480 {
+                source.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            }
+        }
+
+        let resized = preprocess_image(image::DynamicImage::ImageRgb8(source), 64)?;
+        assert!(resized.pixels().all(|pixel| *pixel == image::Rgb([255, 0, 0])));
         Ok(())
     }
 

@@ -26,11 +26,19 @@ pub mod fast_ops;
 mod kernel_archive;
 #[cfg(feature = "hybrid-dequant")]
 pub mod fused_matmul;
-#[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
+#[cfg(all(
+    feature = "neso-metal",
+    target_os = "macos",
+    any(feature = "modernbert-quantized", feature = "mobileclip2")
+))]
 pub mod neso_metal_kernels;
 #[cfg(all(feature = "neso-metal", feature = "modernbert-quantized", target_os = "macos"))]
 mod gpu_modernbert_metal;
-#[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
+#[cfg(all(
+    feature = "neso-d3d12",
+    target_os = "windows",
+    any(feature = "modernbert-quantized", feature = "mobileclip2")
+))]
 pub mod neso_d3d12_kernels;
 #[cfg(all(feature = "neso-d3d12", feature = "modernbert-quantized", target_os = "windows"))]
 mod gpu_modernbert_d3d12;

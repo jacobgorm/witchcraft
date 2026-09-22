@@ -975,12 +975,22 @@ fn open_image_source(path: &Path) -> candle_core::Result<ImageSource> {
     let reader = image::ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .map_err(candle_core::Error::wrap)?;
-    if reader.format().is_none() {
-        return Err(Error::other(format!(
-            "unrecognized image header in {}",
-            path.display()
-        ))
-        .into());
+    match reader.format() {
+        Some(image::ImageFormat::Jpeg | image::ImageFormat::Png | image::ImageFormat::WebP) => {},
+        Some(format) => {
+            return Err(Error::other(format!(
+                "unsupported image format {format:?} in {}",
+                path.display()
+            ))
+            .into());
+        },
+        None => {
+            return Err(Error::other(format!(
+                "unrecognized image header in {}",
+                path.display()
+            ))
+            .into());
+        },
     }
     Ok(ImageSource::Standard(reader))
 }

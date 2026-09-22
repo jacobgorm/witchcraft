@@ -244,6 +244,12 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let invalid = temporary.path().join("invalid.png");
         std::fs::write(&invalid, b"not an image").unwrap();
+        let gif_with_jpeg_extension = temporary.path().join("animation.jpg");
+        std::fs::write(
+            &gif_with_jpeg_extension,
+            b"GIF89a\x01\x00\x01\x00\x00\x00\x00",
+        )
+        .unwrap();
         let valid = temporary.path().join("valid.png");
         let mut jpeg = Vec::new();
         image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
@@ -252,9 +258,13 @@ mod tests {
         std::fs::write(&valid, jpeg).unwrap();
         let mut db = DB::new_fast(temporary.path().join("images.sqlite")).unwrap();
 
-        let counts = register_paths(&mut db, &[invalid, valid.clone()]).unwrap();
+        let counts = register_paths(
+            &mut db,
+            &[invalid, gif_with_jpeg_extension, valid.clone()],
+        )
+        .unwrap();
 
-        assert_eq!(counts, (1, 0, 1));
+        assert_eq!(counts, (1, 0, 2));
         let mut query = db.query("SELECT rowid, body FROM document").unwrap();
         let row = query
             .query_row((), |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))

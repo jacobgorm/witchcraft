@@ -144,7 +144,8 @@ pub use sqlite_index::{
 pub use sqlite_index::{
     cache_image_embeddings, cache_image_embeddings_auto, cache_image_embeddings_auto_many,
     cache_precomputed_image_embeddings, cache_precomputed_image_embeddings_auto,
-    cache_precomputed_l2_int8_image_embeddings, cached_image_rowid,
+    cache_precomputed_l2_int8_image_embeddings, cached_document_embedding_tensor,
+    cached_image_rowid,
     register_image_document_auto,
 };
 #[cfg(all(test, feature = "sqlite"))]
@@ -2213,7 +2214,7 @@ pub fn invalidate_generations_cache(paths: &[PathBuf]) {
     GENERATIONS_CACHE.write().unwrap().remove(paths);
 }
 
-fn clear_generations_cache() {
+pub fn clear_generations_cache() {
     GENERATIONS_CACHE.write().unwrap().clear();
 }
 

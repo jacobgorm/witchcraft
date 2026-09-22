@@ -46,6 +46,7 @@ kernels/out/*
 
 # Test/local data
 backup/
+/thumbnails/
 scifact/
 xtr-base-en/
 *.safetensors

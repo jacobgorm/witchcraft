@@ -1,6 +1,9 @@
 use super::{print_search_results, validate_semantic_search, DB};
 use anyhow::Result;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs::File;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -215,13 +218,153 @@ fn file_url(path: &Path) -> String {
     }
 }
 
-fn image_grid_html(paths: &[PathBuf]) -> String {
+const THUMBNAIL_SIZE: u32 = 640;
+const THUMBNAIL_WORKERS: usize = 4;
+
+fn thumbnail_path_in(directory: &Path, path: &Path) -> PathBuf {
+    let path = witchcraft::normalize_image_path(path);
+    let hash = Sha256::digest(path.to_string_lossy().as_bytes());
+    let name = hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    directory.join(format!("{name}.webp"))
+}
+
+fn thumbnail_is_fresh(source: &Path, thumbnail: &Path) -> bool {
+    let Ok(thumbnail_metadata) = thumbnail.metadata() else {
+        return false;
+    };
+    match (source.metadata(), thumbnail_metadata.modified()) {
+        (Ok(source_metadata), Ok(thumbnail_modified)) => source_metadata
+            .modified()
+            .map(|source_modified| thumbnail_modified >= source_modified)
+            .unwrap_or(true),
+        _ => true,
+    }
+}
+
+fn ensure_thumbnail(path: &Path) -> Result<PathBuf> {
+    ensure_thumbnail_in(&env::current_dir()?.join("thumbnails"), path)
+}
+
+fn ensure_thumbnail_in(directory: &Path, path: &Path) -> Result<PathBuf> {
+    let thumbnail = thumbnail_path_in(directory, path);
+    if thumbnail_is_fresh(path, &thumbnail) {
+        return Ok(thumbnail);
+    }
+    std::fs::create_dir_all(directory)?;
+    let image = witchcraft::mobileclip2::decode_image_oriented(path)?;
+    let image = image.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE).to_rgb8();
+    let output = File::create(&thumbnail)?;
+    image::codecs::webp::WebPEncoder::new_lossless(output).encode(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(thumbnail)
+}
+
+fn generate_thumbnails(
+    paths: &[PathBuf],
+    progress: Option<&witchcraft::progress::Bar>,
+) -> (HashMap<PathBuf, PathBuf>, usize) {
+    let mut seen = HashSet::new();
+    let unique = paths
+        .iter()
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut generated = HashMap::new();
+    let mut failed = 0usize;
+    for chunk in unique.chunks(THUMBNAIL_WORKERS) {
+        let results = std::thread::scope(|scope| {
+            chunk
+                .iter()
+                .map(|path| {
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        let thumbnail = ensure_thumbnail(&path);
+                        (path, thumbnail)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|worker| worker.join().expect("thumbnail worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        for (source, thumbnail) in results {
+            match thumbnail {
+                Ok(thumbnail) => {
+                    generated.insert(source, thumbnail);
+                },
+                Err(error) => {
+                    failed += 1;
+                    eprintln!("[WARN] could not create thumbnail for {}: {error}", source.display());
+                },
+            }
+            if let Some(progress) = progress {
+                progress.inc(1);
+            }
+        }
+    }
+    (generated, failed)
+}
+
+fn thumbnail_sources(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let (generated, _) = generate_thumbnails(paths, None);
+    paths
+        .iter()
+        .map(|path| generated.get(path).cloned().unwrap_or_else(|| path.clone()))
+        .collect()
+}
+
+fn create_registered_thumbnails(paths: &[PathBuf]) -> Result<()> {
+    let directory = env::current_dir()?.join("thumbnails");
+    let mut seen = HashSet::new();
+    let unique = paths
+        .iter()
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let pending = unique
+        .iter()
+        .filter(|path| !thumbnail_is_fresh(path, &thumbnail_path_in(&directory, path)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let skipped = unique.len() - pending.len();
+    if pending.is_empty() {
+        println!("all {skipped} registered images already have fresh WebP thumbnails");
+        return Ok(());
+    }
+    let progress = witchcraft::progress::new_with_label(pending.len() as u64, "create thumbnails");
+    let (generated, failed) = generate_thumbnails(&pending, Some(&progress));
+    progress.finish();
+    println!(
+        "created {} WebP thumbnails, skipped {skipped} fresh, {failed} failed in {}",
+        generated.len(),
+        directory.display()
+    );
+    Ok(())
+}
+
+fn image_grid_html_with_links(
+    paths: &[PathBuf],
+    sources: Option<&[PathBuf]>,
+    links: Option<&[String]>,
+) -> String {
     let mut tiles = String::new();
-    for path in paths.iter().take(9) {
+    for (index, path) in paths.iter().take(9).enumerate() {
         let url = file_url(path);
+        let source_url = sources
+            .and_then(|sources| sources.get(index))
+            .map(|source| file_url(source))
+            .unwrap_or_else(|| url.clone());
+        let link = links
+            .and_then(|links| links.get(index))
+            .map(String::as_str)
+            .unwrap_or(&url);
         let label = html_escape(&path.to_string_lossy());
         tiles.push_str(&format!(
-            "<figure><a href=\"{url}\"><img src=\"{url}\" alt=\"{label}\"></a><figcaption>{label}</figcaption></figure>\n"
+            "<figure><a href=\"{link}\"><img src=\"{source_url}\" alt=\"{label}\"></a><figcaption>{label}</figcaption></figure>\n"
         ));
     }
     format!(
@@ -233,6 +376,11 @@ fn image_grid_html(paths: &[PathBuf]) -> String {
          figcaption{{padding:5px 7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}}\
          </style></head><body><main>{tiles}</main></body></html>"
     )
+}
+
+#[cfg(test)]
+fn image_grid_html(paths: &[PathBuf]) -> String {
+    image_grid_html_with_links(paths, None, None)
 }
 
 fn open_image_grid(path: &Path) -> std::io::Result<()> {
@@ -262,8 +410,57 @@ pub fn display_image_grid(paths: &[PathBuf]) {
     if paths.is_empty() || !std::io::stdout().is_terminal() {
         return;
     }
+    let sources = thumbnail_sources(paths);
     let preview = env::temp_dir().join("witchcraft-image-preview.html");
-    if let Err(error) = std::fs::write(&preview, image_grid_html(paths)) {
+    if let Err(error) = std::fs::write(
+        &preview,
+        image_grid_html_with_links(paths, Some(&sources), None),
+    ) {
+        eprintln!("warning: could not write image preview: {error}");
+        return;
+    }
+    if let Err(error) = open_image_grid(&preview) {
+        eprintln!("warning: could not open image preview: {error}");
+    }
+}
+
+pub fn display_image_grid_with_neighbors(paths: &[PathBuf], neighbors: &[Vec<PathBuf>]) {
+    if paths.is_empty() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    let pages = env::temp_dir().join("witchcraft-image-neighbors");
+    if let Err(error) = std::fs::create_dir_all(&pages) {
+        eprintln!("warning: could not create image neighbor pages: {error}");
+        return;
+    }
+    let mut all_paths = paths.iter().take(9).cloned().collect::<Vec<_>>();
+    for image_neighbors in neighbors.iter().take(paths.len().min(9)) {
+        all_paths.extend(image_neighbors.iter().take(9).cloned());
+    }
+    let all_sources = thumbnail_sources(&all_paths);
+    let main_count = paths.len().min(9);
+    let main_sources = &all_sources[..main_count];
+    let mut source_offset = main_count;
+    let mut links = Vec::with_capacity(paths.len().min(9));
+    for (index, image_neighbors) in neighbors.iter().take(paths.len().min(9)).enumerate() {
+        let page = pages.join(format!("neighbors-{index}.html"));
+        let count = image_neighbors.len().min(9);
+        let sources = &all_sources[source_offset..source_offset + count];
+        source_offset += count;
+        if let Err(error) = std::fs::write(
+            &page,
+            image_grid_html_with_links(image_neighbors, Some(sources), None),
+        ) {
+            eprintln!("warning: could not write image neighbor page: {error}");
+            return;
+        }
+        links.push(file_url(&page));
+    }
+    let preview = env::temp_dir().join("witchcraft-image-preview.html");
+    if let Err(error) = std::fs::write(
+        &preview,
+        image_grid_html_with_links(paths, Some(main_sources), Some(&links)),
+    ) {
         eprintln!("warning: could not write image preview: {error}");
         return;
     }
@@ -344,21 +541,27 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             anyhow::ensure!(args.len() == 2, "clipembed takes no arguments");
             super::mobileclip2_ivf::embed(assets)?;
         },
+        "clipthumbnails" => {
+            anyhow::ensure!(args.len() == 2, "clipthumbnails takes no arguments");
+            let paths = super::mobileclip2_ivf::registered_paths()?;
+            create_registered_thumbnails(&paths)?;
+        },
         "clipindex" => {
             anyhow::ensure!(args.len() == 2, "clipindex takes no arguments");
             super::mobileclip2_ivf::update_index()?;
         },
         "clipquery" => {
-            let display_images = args[2..].iter().any(|argument| argument == "-d");
+            let display_neighbors = args[2..].iter().any(|argument| argument == "-D");
+            let display_images = display_neighbors || args[2..].iter().any(|argument| argument == "-d");
             let exact = args[2..].iter().any(|argument| argument == "--exact");
             let query_args = args[2..]
                 .iter()
-                .filter(|argument| !matches!(argument.as_str(), "-d" | "--exact"))
+                .filter(|argument| !matches!(argument.as_str(), "-d" | "-D" | "--exact"))
                 .cloned()
                 .collect::<Vec<_>>();
             anyhow::ensure!(
                 !query_args.is_empty(),
-                "clipquery expects [-d] [--exact] <text>..."
+                "clipquery expects [-d|-D] [--exact] <text>..."
             );
             let results = super::mobileclip2_ivf::query(
                 assets,
@@ -367,7 +570,10 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
                 exact,
             )?;
             let image_paths = print_search_results(results);
-            if display_images {
+            if display_neighbors {
+                let neighbors = super::mobileclip2_ivf::nearest_neighbors(&image_paths, 9)?;
+                display_image_grid_with_neighbors(&image_paths, &neighbors);
+            } else if display_images {
                 display_image_grid(&image_paths);
             }
         },
@@ -442,7 +648,10 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_url, image_grid_html, image_paths_in_directories};
+    use super::{
+        ensure_thumbnail_in, file_url, image_grid_html, image_grid_html_with_links,
+        image_paths_in_directories, thumbnail_path_in,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -452,6 +661,35 @@ mod tests {
         let html = image_grid_html(&[path]);
         assert!(html.contains("file:///tmp/a%20photo%20%26%20%3Ccopy%3E.jpg"));
         assert!(html.contains("/tmp/a photo &amp; &lt;copy&gt;.jpg"));
+    }
+
+    #[test]
+    fn image_preview_can_link_tiles_to_neighbor_pages() {
+        let path = PathBuf::from("/tmp/photo.jpg");
+        let html = image_grid_html_with_links(
+            &[path],
+            Some(&[PathBuf::from("/tmp/thumb.webp")]),
+            Some(&["file:///tmp/neighbors-0.html".into()]),
+        );
+        assert!(html.contains("href=\"file:///tmp/neighbors-0.html\""));
+        assert!(html.contains("src=\"file:///tmp/thumb.webp\""));
+    }
+
+    #[test]
+    fn thumbnails_use_a_filename_hash_and_preserve_aspect_ratio() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("original name.jpg");
+        let image = image::RgbImage::from_pixel(1280, 640, image::Rgb([20, 40, 60]));
+        image.save(&source).unwrap();
+        let thumbnail_dir = temporary.path().join("thumbnails");
+
+        let expected = thumbnail_path_in(&thumbnail_dir, &source);
+        let thumbnail = ensure_thumbnail_in(&thumbnail_dir, &source).unwrap();
+
+        assert_eq!(thumbnail, expected);
+        assert_eq!(thumbnail.extension().unwrap(), "webp");
+        assert_eq!(thumbnail.file_stem().unwrap().len(), 64);
+        assert_eq!(image::open(thumbnail).unwrap().to_rgb8().dimensions(), (640, 320));
     }
 
     #[test]

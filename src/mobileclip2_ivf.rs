@@ -6,6 +6,13 @@ use witchcraft::{DB, IndexOptions};
 const DATABASE: &str = "mobileclip2-ivf.sqlite";
 const BATCH_SIZE: usize = 8;
 
+pub fn registered_paths() -> Result<Vec<PathBuf>> {
+    let db = DB::new_reader(PathBuf::from(DATABASE))?;
+    let mut query = db.query("SELECT body FROM document ORDER BY rowid")?;
+    let rows = query.query_map((), |row| row.get::<_, String>(0))?;
+    rows.map(|row| Ok(PathBuf::from(row?))).collect()
+}
+
 pub fn register(paths: &[PathBuf]) -> Result<()> {
     let mut db = DB::new_fast(PathBuf::from(DATABASE))?;
     let (added, reused, skipped) = register_paths(&mut db, paths)?;
@@ -206,6 +213,48 @@ pub fn query(
     } else {
         witchcraft::search_embeddings(&db, &query, None, 0.0, limit, None, false)
     }
+}
+
+pub fn nearest_neighbors(paths: &[PathBuf], limit: usize) -> Result<Vec<Vec<PathBuf>>> {
+    let db = DB::new_reader(PathBuf::from(DATABASE))?;
+    if let Some(reason) = witchcraft::semantic_index_unavailable_reason(&db)? {
+        anyhow::bail!("pooled MobileCLIP2 IVF index is not ready: {reason}; run clipindex");
+    }
+    let device = witchcraft::make_device();
+    // The preceding text query may have populated the process-wide centroid
+    // cache using a different Candle Device handle for the same GPU.
+    witchcraft::clear_generations_cache();
+    let mut all_neighbors = Vec::with_capacity(paths.len());
+    for path in paths {
+        let rowid = witchcraft::cached_image_rowid(&db, path)?
+            .ok_or_else(|| anyhow::anyhow!("no pooled MobileCLIP2 embedding for {}", path.display()))?;
+        let query = witchcraft::cached_document_embedding_tensor(&db, rowid)?
+            .ok_or_else(|| anyhow::anyhow!("missing pooled MobileCLIP2 embedding for {}", path.display()))?
+            .to_device(&device)?;
+        let source = witchcraft::normalize_image_path(path);
+        let results = witchcraft::search_embeddings(
+            &db,
+            &query,
+            None,
+            0.0,
+            limit + 1,
+            None,
+            false,
+        )?;
+        let mut neighbors = Vec::with_capacity(limit);
+        for (_, _, bodies, sub_idx, _) in results {
+            let index = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+            let candidate = witchcraft::normalize_image_path(Path::new(&bodies[index]));
+            if candidate != source && !neighbors.contains(&candidate) {
+                neighbors.push(candidate);
+            }
+            if neighbors.len() == limit {
+                break;
+            }
+        }
+        all_neighbors.push(neighbors);
+    }
+    Ok(all_neighbors)
 }
 
 #[cfg(test)]

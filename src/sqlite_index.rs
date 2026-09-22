@@ -1522,6 +1522,19 @@ pub fn cached_image_rowid(db: &DB, path: &std::path::Path) -> Result<Option<u64>
     .map_err(Into::into)
 }
 
+#[cfg(feature = "mobileclip2")]
+pub fn cached_document_embedding_tensor(db: &DB, rowid: u64) -> Result<Option<Tensor>> {
+    let cache = SqliteEmbeddingCache::new(db);
+    let Some(cached) = cache.get_for_document(rowid, "")? else {
+        return Ok(None);
+    };
+    Ok(Some(Tensor::embeddings_from_packed(
+        &cached.embeddings,
+        dim_from_model_id(&cached.model),
+        &Device::Cpu,
+    )?))
+}
+
 /// Register an image document without computing its embeddings. The canonical
 /// path is its stable identity, so repeated registration returns the same rowid.
 #[cfg(feature = "mobileclip2")]

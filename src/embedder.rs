@@ -113,13 +113,7 @@ impl Embedder {
             any(feature = "modernbert", feature = "modernbert-quantized")
         ))]
         let image_model = {
-            #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
-            let image_device = Device::new_d3d12(0).unwrap_or_else(|err| {
-                log::warn!("unable to create D3D12 image device: {err}; using {device:?}");
-                device.clone()
-            });
-            #[cfg(not(all(feature = "neso-d3d12", target_os = "windows")))]
-            let image_device = device.clone();
+            let image_device = crate::make_image_device(device);
             crate::mobileclip2::XtrImageEncoder::load(&image_device, assets)?
         };
         Ok(Self {

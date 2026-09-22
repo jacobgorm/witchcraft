@@ -387,7 +387,8 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
         },
         "benchclipimage" => {
             anyhow::ensure!(args.len() >= 3, "benchclipimage expects an image path");
-            let device = witchcraft::make_device();
+            let fallback_device = witchcraft::make_device();
+            let device = witchcraft::make_image_device(&fallback_device);
             let started = Instant::now();
             let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
             println!("model_load_ms: {:.2}", started.elapsed().as_secs_f64() * 1000.0);

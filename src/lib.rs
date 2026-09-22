@@ -523,6 +523,17 @@ pub fn make_device() -> Device {
     }
 }
 
+pub fn make_image_device(fallback: &Device) -> Device {
+    #[cfg(all(feature = "neso-d3d12", target_os = "windows"))]
+    return Device::new_d3d12(0).unwrap_or_else(|err| {
+        warn!("unable to create D3D12 image device: {err}; using {fallback:?}");
+        fallback.clone()
+    });
+
+    #[cfg(not(all(feature = "neso-d3d12", target_os = "windows")))]
+    fallback.clone()
+}
+
 #[cfg(all(feature = "progress", not(feature = "napi")))]
 pub mod progress {
     use indicatif::{ProgressBar, ProgressStyle};

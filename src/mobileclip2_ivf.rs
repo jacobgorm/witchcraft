@@ -67,8 +67,10 @@ pub fn embed(assets: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let device = witchcraft::make_device();
+    let fallback_device = witchcraft::make_device();
+    let device = witchcraft::make_image_device(&fallback_device);
     let model = witchcraft::mobileclip2::StockMobileClip2::load(&device, assets)?;
+    log::info!("pooled MobileCLIP2 image device: {:?}", model.device().location());
     let progress = witchcraft::progress::new_with_label(missing.len() as u64, "embed images");
     let mut embedded = 0usize;
     let mut failed = 0usize;

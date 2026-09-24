@@ -7,6 +7,8 @@ use witchcraft::{DB, IndexOptions};
 
 const DATABASE: &str = "mobileclip2-ivf.sqlite";
 const BATCH_SIZE: usize = 8;
+const RESIDUAL_QUANT_BITS: u8 = 4;
+const DEFAULT_SCAN_BUDGET: usize = 5_000;
 type SearchResult = (f32, String, Vec<String>, u32, String);
 
 pub fn registered_paths() -> Result<Vec<PathBuf>> {
@@ -227,7 +229,7 @@ pub fn update_index() -> Result<()> {
         &db,
         None,
         false,
-        IndexOptions::new(4)?.force_flush(),
+        IndexOptions::new(RESIDUAL_QUANT_BITS)?.force_flush(),
     )?;
     println!("pooled MobileCLIP2 IVF index is ready");
     Ok(())
@@ -486,6 +488,7 @@ pub fn query(
     limit: usize,
     exact: bool,
     clustered: bool,
+    scan_budget: Option<usize>,
 ) -> Result<Vec<SearchResult>> {
     let db = DB::new_reader(PathBuf::from(DATABASE))?;
     if !exact {
@@ -517,11 +520,14 @@ pub fn query(
     } else {
         limit
     };
-    let results = if exact {
-        witchcraft::exact_search_embeddings(&db, &query, candidate_limit)?
-    } else {
-        witchcraft::search_embeddings(&db, &query, None, 0.0, candidate_limit, None, false)?
-    };
+    let effective_scan_budget = (!exact).then_some(scan_budget.unwrap_or(DEFAULT_SCAN_BUDGET));
+    let results = witchcraft::with_vector_scan_budget(effective_scan_budget, || {
+        if exact {
+            witchcraft::exact_search_embeddings(&db, &query, candidate_limit)
+        } else {
+            witchcraft::search_embeddings(&db, &query, None, 0.0, candidate_limit, None, false)
+        }
+    })?;
     if clustered {
         cluster_results(&db, &query, results, limit)
     } else {
@@ -546,15 +552,9 @@ pub fn nearest_neighbors(paths: &[PathBuf], limit: usize) -> Result<Vec<Vec<Path
             .ok_or_else(|| anyhow::anyhow!("missing pooled MobileCLIP2 embedding for {}", path.display()))?
             .to_device(&device)?;
         let source = witchcraft::normalize_image_path(path);
-        let results = witchcraft::search_embeddings(
-            &db,
-            &query,
-            None,
-            0.0,
-            limit + 1,
-            None,
-            false,
-        )?;
+        let results = witchcraft::with_vector_scan_budget(Some(DEFAULT_SCAN_BUDGET), || {
+            witchcraft::search_embeddings(&db, &query, None, 0.0, limit + 1, None, false)
+        })?;
         let mut neighbors = Vec::with_capacity(limit);
         for (_, _, bodies, sub_idx, _) in results {
             let index = (sub_idx as usize).min(bodies.len().saturating_sub(1));

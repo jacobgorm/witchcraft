@@ -248,6 +248,28 @@ const IMAGE_HUB_CENTROID_FLOOR: f32 = 0.55;
 const IMAGE_HUB_CENTROID_WEIGHT: f32 = 0.4;
 const IMAGE_HUB_MAX_PENALTY: f32 = 0.1;
 const IMAGE_VECTOR_SCORE_BOOST: f32 = 0.21;
+thread_local! {
+    static VECTOR_SCAN_BUDGET: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub fn with_vector_scan_budget<T>(budget: Option<usize>, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            VECTOR_SCAN_BUDGET.with(|current| current.set(self.0));
+        }
+    }
+
+    let previous = VECTOR_SCAN_BUDGET.with(|current| current.replace(budget));
+    let _restore = Restore(previous);
+    operation()
+}
+
+fn vector_scan_budget() -> Option<usize> {
+    VECTOR_SCAN_BUDGET.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct IndexOptions {
@@ -2143,6 +2165,7 @@ struct MatchIoCounters {
     candidate_buckets: usize,
     selected_buckets: usize,
     selected_slots: usize,
+    scanned_vectors: usize,
     read: BucketReadStats,
 }
 
@@ -2166,6 +2189,7 @@ fn record_bucket_io_counters(counters: MatchIoCounters) {
         total.candidate_buckets += counters.candidate_buckets;
         total.selected_buckets += counters.selected_buckets;
         total.selected_slots += counters.selected_slots;
+        total.scanned_vectors += counters.scanned_vectors;
         total.read.batches += counters.read.batches;
         total.read.buckets += counters.read.buckets;
         total.read.bytes += counters.read.bytes;
@@ -2186,11 +2210,12 @@ pub fn log_bucket_io_counters() {
         }
         let q = counters.queries as f64;
         info!(
-            "bucket io counters: queries={} avg_candidates={:.1} avg_selected_buckets={:.1} avg_selected_slots={:.1} avg_read_batches={:.1} avg_read_buckets={:.1} avg_read_mb={:.2}",
+            "bucket io counters: queries={} avg_candidates={:.1} avg_selected_buckets={:.1} avg_selected_slots={:.1} avg_scanned_vectors={:.1} avg_read_batches={:.1} avg_read_buckets={:.1} avg_read_mb={:.2}",
             counters.queries,
             counters.candidate_buckets as f64 / q,
             counters.selected_buckets as f64 / q,
             counters.selected_slots as f64 / q,
+            counters.scanned_vectors as f64 / q,
             counters.read.batches as f64 / q,
             counters.read.buckets as f64 / q,
             counters.read.bytes as f64 / q / (1024.0 * 1024.0),
@@ -2766,8 +2791,8 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
             )
         })?;
 
-    let k = 32;
-    let t_prime = 40000;
+    let scan_budget = vector_scan_budget();
+    let t_prime = scan_budget.unwrap_or(40_000);
     let device = query_embeddings.device();
     let (m, query_dim) = query_embeddings.dims2()?;
 
@@ -2797,7 +2822,13 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
         let gen_idx = gen_centroid_scores_all.len();
         let n_centroids = gen.sizes.len();
 
-        let candidates = gen.routed_centroid_candidates(query_embeddings)?;
+        let candidates = if scan_budget.is_some() {
+            // Score every leaf centroid so that the population budget, rather
+            // than the coarse hierarchy shape, controls recall.
+            (0..n_centroids).collect::<Vec<_>>()
+        } else {
+            gen.routed_centroid_candidates(query_embeddings)?
+        };
         io_counters.candidate_buckets += candidates.len();
         let candidate_indices: Vec<u32> = candidates.iter().map(|&idx| idx as u32).collect();
         let candidate_index_tensor =
@@ -2819,7 +2850,7 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
 
-        let mut topk_clusters = Vec::with_capacity(k);
+        let mut topk_clusters = Vec::with_capacity(candidates.len());
         let mut gen_centroid_score_ranges = Vec::with_capacity(m);
         for i in 0..m {
             let row = sorted_indices.get(i)?;
@@ -2828,7 +2859,11 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
             let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
             let row = row.to_vec1::<u32>()?;
             let mut cumsum = 0;
-            let selection_limit = candidates.len().min(k);
+            let selection_limit = if scan_budget.is_some() {
+                candidates.len()
+            } else {
+                candidates.len().min(32)
+            };
             if selection_limit == 0 {
                 continue;
             }
@@ -2998,6 +3033,7 @@ pub(crate) fn match_centroids_raw_with_image_score_boost(
         record_bucket_io_counters(io_counters);
         return Ok(vec![]);
     }
+    io_counters.scanned_vectors = count;
 
     let missing_similarities = missing;
 

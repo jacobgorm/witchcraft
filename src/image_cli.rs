@@ -637,24 +637,37 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             let display_images = display_neighbors || args[2..].iter().any(|argument| argument == "-d");
             let exact = args[2..].iter().any(|argument| argument == "--exact");
             let clustered = args[2..].iter().any(|argument| argument == "--clusters");
-            let query_args = args[2..]
-                .iter()
-                .filter(|argument| {
-                    !matches!(argument.as_str(), "-d" | "-D" | "--exact" | "--clusters")
-                })
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut scan_budget = None;
+            let mut query_args = Vec::new();
+            let mut arguments = args[2..].iter();
+            while let Some(argument) = arguments.next() {
+                match argument.as_str() {
+                    "-d" | "-D" | "--exact" | "--clusters" => {},
+                    "--scan-budget" => {
+                        let value = arguments
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("--scan-budget expects a positive integer"))?;
+                        let value = value.parse::<usize>()?;
+                        anyhow::ensure!(value > 0, "--scan-budget must be greater than zero");
+                        scan_budget = Some(value);
+                    },
+                    _ => query_args.push(argument.clone()),
+                }
+            }
             anyhow::ensure!(
                 !query_args.is_empty(),
-                "clipquery expects [-d|-D] [--exact] [--clusters] <text>..."
+                "clipquery expects [-d|-D] [--exact] [--clusters] [--scan-budget N] <text>..."
             );
+            witchcraft::reset_bucket_io_counters();
             let results = super::mobileclip2_ivf::query(
                 assets,
                 &query_args.join(" "),
                 10,
                 exact,
                 clustered,
+                scan_budget,
             )?;
+            witchcraft::log_bucket_io_counters();
             let clusters = clustered.then(|| cluster_preview_data(&results));
             let image_paths = print_search_results(results);
             if display_images && clustered {

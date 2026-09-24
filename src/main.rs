@@ -553,7 +553,7 @@ fn main() -> Result<()> {
         let mut db = DB::new_fast(db_name).unwrap();
         db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipregister <directory>... | clipembed | cliptag | clipthumbnails | clipindex | clipquery [-d|-D] [--exact] [--clusters] <text>... | index | reindex | saliency <text> | image <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | imagetags <path> | embedimage [rowid] <path> | embedimages [--force] <directory>... | clipregister <directory>... | clipembed | cliptag | clipthumbnails | clipindex | clipquery [-d|-D] [--exact] [--clusters] [--scan-budget N] <text>... | index | reindex | saliency <text> | image <path> [iters] [warmup] [profile] | scoreimage <path> <text>... | query [-d] <text> | queryimage [-d] <path> | hybrid [-d] <text> | querycsv|exactcsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

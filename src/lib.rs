@@ -19,7 +19,7 @@ pub mod quantized_t5;
 #[cfg(feature = "t5-quantized")]
 use quantized_t5 as t5_encoder;
 pub mod fast_ops;
-#[cfg(all(feature = "modernbert-quantized", any(
+#[cfg(all(any(feature = "modernbert-quantized", feature = "mobileclip2"), any(
     all(feature = "neso-metal", target_os = "macos"),
     all(feature = "neso-d3d12", target_os = "windows"),
 )))]

@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        is_year_token, normalize_image_path,
-        query_weights_from_gate_scores, DB, EmbeddingCache,
+        is_year_token, normalize_image_path, query_weights_from_gate_scores, DB, EmbeddingCache,
     };
     use candle_core::{Device, Tensor};
     use std::path::PathBuf;

@@ -710,7 +710,7 @@ pub fn run(args: &[String], assets: &Path, db_name: &Path) -> Result<bool> {
             for text in &args[3..] {
                 #[cfg(any(feature = "modernbert", feature = "modernbert-quantized"))]
                 {
-                    let query = embedder.embed(text)?.0.squeeze(0)?;
+                    let query = embedder.embed_query(text)?.0.squeeze(0)?;
                     println!("`{text}': score={}", maxsim_similarity(&query, &image)?);
                 }
                 #[cfg(not(any(feature = "modernbert", feature = "modernbert-quantized")))]

@@ -1,0 +1,29 @@
+commit 7606116865785954721f424e068195040be262c4
+Author: Jacob Gorm Hansen <jhansen@dropbox.com>
+Date:   Mon May 4 19:51:07 2026 +0200
+
+    Run granite v18 with longer warmup
+
+diff --git a/config-granite-97m.yaml b/config-granite-97m.yaml
+index bdbcf93..7e7bb0b 100644
+--- a/config-granite-97m.yaml
++++ b/config-granite-97m.yaml
+@@ -31,10 +31,9 @@ kd_batch_size: 4
+ kd_weight: 0.5
+ kd_temperature: 1.0
+ kd_student_temperature: 0.05
+-kd_k_train: 64
+ epochs: 2
+ weight_decay: 0.01
+-warmup_steps: 200
++warmup_steps: 1000
+ gradient_accumulation_steps: 2
+ max_grad_norm: 1.0
+ temperature: 0.05
+@@ -46,5 +45,5 @@ keep_last_n_checkpoints: -1
+ save_each_epoch: true
+ 
+ # ── output ─────────────────────────────────────────────────────────
+-output_dir: "checkpoints-granite-97m-v17"
++output_dir: "checkpoints-granite-97m-v18"
+ log_every: 10
